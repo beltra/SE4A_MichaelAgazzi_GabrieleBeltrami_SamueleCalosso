@@ -1,0 +1,25 @@
+services:
+  uav-testing:
+    container_name: se4a-uav-testing
+    shm_size: '2gb'
+    volumes:
+      - ../shared:/shared
+      - ../snippets:/src/generator/
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /var/run/docker.sock:/var/run/docker.sock
+      - $HOME/.Xauthority:/tmp/.Xauthority:rw
+      - ./sysroot:/opt/sysroot:ro
+    environment:
+      - DISPLAY=${DISPLAY}
+      - XAUTHORITY=/tmp/.Xauthority
+      - VSCODE_SERVER_CUSTOM_GLIBC_LINKER=/opt/sysroot/lib/ld-linux-x86-64.so.2
+      - VSCODE_SERVER_CUSTOM_GLIBC_PATH=/opt/sysroot/lib:/opt/sysroot/usr/lib
+      - VSCODE_SERVER_PATCHELF_PATH=/usr/local/bin/patchelf
+    cap_add:
+      - SYS_PTRACE
+    command: /bin/sh -c "while sleep 1000; do :; done"
+    build:
+      context: ../snippets
+      dockerfile: Dockerfile
+    privileged: true
+    tty: true

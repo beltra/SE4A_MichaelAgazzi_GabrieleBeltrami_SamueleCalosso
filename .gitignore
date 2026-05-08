@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Generator outputs
+snippets/logs/
+snippets/results/
+snippets/generated_tests/
+snippets/ga_output/
+
+# Local environment
+.env
+venv/
+.venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
