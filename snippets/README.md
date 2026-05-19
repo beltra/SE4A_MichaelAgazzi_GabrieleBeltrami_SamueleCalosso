@@ -6,12 +6,12 @@ You can integrate Aerialist's python package in your own code and directly defin
 2. Experiment first with the local agent provided by the Docker image — make sure you can run test cases inside the container using the helper scripts at the repo root.
 3. Check [`TestCase`](testcase.py) for a simple wrapper that defines and executes a test case.
 4. Check [`RandomGenerator`](random_generator.py) for a baseline generator that drops obstacles with random size and position into a case-study mission.
-5. Check [`cli.py`](cli.py) for the entry point that wires the generator into Aerialist.
+5. Check [`cli.py`](cli.py) for the entry point; the active generator is chosen via the `GENERATOR` constant at the top of the file.
 6. Check [`Dockerfile`](Dockerfile) for how to dockerise your own code.
 
 ## Usage
 
-Invoke the entry point with the `generate` subcommand:
+Select the generator by editing the `GENERATOR` constant at the top of [`cli.py`](cli.py) (`"ga"` or `"random"`), then run:
 
 ```bash
 python3 cli.py generate <test> <budget>

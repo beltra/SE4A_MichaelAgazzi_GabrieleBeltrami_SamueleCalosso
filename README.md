@@ -22,7 +22,7 @@ The UAV Testing Competition is organised jointly with [ICST 2026](https://conf.r
 - [`docker/docker-compose-nogpu.yml`](docker/docker-compose-nogpu.yml): CPU-only container setup
 - [`docker/docker-compose-windows.yml`](docker/docker-compose-windows.yml): Windows Docker Desktop setup with X forwarding
 - [`snippets/Dockerfile`](snippets/Dockerfile): image definition for the generator environment
-- [`snippets/cli.py`](snippets/cli.py): entry point that runs the bundled generator
+- [`snippets/cli.py`](snippets/cli.py): entry point that dispatches on the chosen generator (selected via the `GENERATOR` constant at the top of the file)
 - [`snippets/random_generator.py`](snippets/random_generator.py): sample random-obstacle generator
 - [`snippets/testcase.py`](snippets/testcase.py): execution wrapper around an `AerialistTest`
 - [`snippets/case_studies/`](snippets/case_studies): sample missions, plans, parameters, logs, and images
@@ -56,7 +56,7 @@ cd /src/generator
 python3 cli.py generate case_studies/mission1.yaml 5
 ```
 
-This runs the sample `RandomGenerator` for `5` test cases on `mission1.yaml`.
+This runs the selected generator for `5` test cases on `mission1.yaml`. The active generator is chosen by the `GENERATOR` constant at the top of [`snippets/cli.py`](snippets/cli.py) (`"ga"` for the genetic algorithm, `"random"` for the baseline random generator).
 
 ## Case Studies
 

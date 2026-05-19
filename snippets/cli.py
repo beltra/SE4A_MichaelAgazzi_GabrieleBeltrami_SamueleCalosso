@@ -6,7 +6,15 @@ import os
 import shutil
 import sys
 from decouple import config
-from random_generator import RandomGenerator
+
+GENERATOR = "ga"  # "ga" or "random"
+
+if GENERATOR == "ga":
+    from geneticAlgorithm.generator import GeneticGenerator as Generator
+elif GENERATOR == "random":
+    from random_generator import RandomGenerator as Generator
+else:
+    raise ValueError(f"unknown generator: {GENERATOR!r}")
 
 TESTS_FOLDER = config("TESTS_FOLDER", default="./generated_tests/")
 logger = logging.getLogger(__name__)
@@ -58,7 +66,7 @@ if __name__ == "__main__":
     config_loggers()
     try:
         args = arg_parse()
-        generator = RandomGenerator(case_study_file=args.test)
+        generator = Generator(args.test)
         test_cases = generator.generate(args.budget)
 
         ### copying the test cases to the output folder
