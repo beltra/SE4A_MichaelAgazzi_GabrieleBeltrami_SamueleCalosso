@@ -106,17 +106,18 @@ def crossover(a: Individual, b: Individual) -> Individual:
 
 
 def mutate(ind: Individual) -> Individual:
-    for o in ind.obstacles:
-        if random.random() < MUTATION_RATE:
-            o.size.l = gaussianPerturb(o.size.l, L_MIN, L_MAX)
-        if random.random() < MUTATION_RATE:
-            o.size.w = gaussianPerturb(o.size.w, W_MIN, W_MAX)
-        if random.random() < MUTATION_RATE:
-            o.position.x = gaussianPerturb(o.position.x, X_MIN, X_MAX)
-        if random.random() < MUTATION_RATE:
-            o.position.y = gaussianPerturb(o.position.y, Y_MIN, Y_MAX)
-        if random.random() < MUTATION_RATE:
-            o.position.r = gaussianPerturb(o.position.r, R_MIN, R_MAX)
+    # Obstacle.Size and Obstacle.Position are NamedTuples (immutable);
+    # mutate by constructing a fresh Obstacle so internal geometry is rebuilt.
+    for idx, o in enumerate(ind.obstacles):
+        l = gaussianPerturb(o.size.l, L_MIN, L_MAX) if random.random() < MUTATION_RATE else o.size.l
+        w = gaussianPerturb(o.size.w, W_MIN, W_MAX) if random.random() < MUTATION_RATE else o.size.w
+        x = gaussianPerturb(o.position.x, X_MIN, X_MAX) if random.random() < MUTATION_RATE else o.position.x
+        y = gaussianPerturb(o.position.y, Y_MIN, Y_MAX) if random.random() < MUTATION_RATE else o.position.y
+        r = gaussianPerturb(o.position.r, R_MIN, R_MAX) if random.random() < MUTATION_RATE else o.position.r
+        ind.obstacles[idx] = Obstacle(
+            Obstacle.Size(l=l, w=w, h=H_FIXED),
+            Obstacle.Position(x=x, y=y, z=0, r=r),
+        )
     if random.random() < ADD_PROB and len(ind.obstacles) < MAX_OBSTACLES:
         ind.obstacles.append(randomObstacle())
     if random.random() < REMOVE_PROB and len(ind.obstacles) > 1:
