@@ -61,6 +61,7 @@ echo "========================================"
 
 # Check if the container is already running
 RUNNING=$(docker compose -f "$COMPOSE_FILE" ps -q "$SERVICE_NAME")
+FRESH_START=false
 
 if [ "$REBUILD" = true ]; then
     echo "Rebuilding image..."
@@ -69,6 +70,7 @@ if [ "$REBUILD" = true ]; then
         xhost +local:docker || true
     fi
     docker compose -f "$COMPOSE_FILE" up -d --build
+    FRESH_START=true
 elif [ -z "$RUNNING" ]; then
     echo "Container not running. Ensuring it exists..."
 
@@ -80,11 +82,24 @@ elif [ -z "$RUNNING" ]; then
     # Start the container in detached mode.
     # --no-recreate ensures we don't destroy an existing stopped container.
     docker compose -f "$COMPOSE_FILE" up -d --no-recreate
+    FRESH_START=true
 else
     echo "Container is already running. Skipping start..."
 fi
 
+# Apply Aerialist source-tree patches once
+if [ "$FRESH_START" = true ]; then
+    echo "Applying Aerialist patches..."
+    docker compose -f "$COMPOSE_FILE" exec -T "$SERVICE_NAME" \
+        /bin/bash -c "cd /src/generator && python3 patchAerialist.py" || true
+fi
+
 if [ "$SIM" = true ]; then
+    # Kill stale runs
+    echo "Killing any leftover simulation processes..."
+    docker compose -f "$COMPOSE_FILE" exec -T "$SERVICE_NAME" \
+        /bin/bash /src/generator/kill_simulations.sh || true
+
     CMD="cd /src/generator && python3 cli.py ${SIM_ARGS[*]}"
     echo "Running inside container: $CMD"
     docker compose -f "$COMPOSE_FILE" exec -T "$SERVICE_NAME" /bin/bash -c "$CMD"
