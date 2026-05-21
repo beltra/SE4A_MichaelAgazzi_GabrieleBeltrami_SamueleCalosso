@@ -67,6 +67,9 @@ class GAConfig:
     # Path-aware seeding.
     pathBiasProb: float = 0.8
     pathSigma: float = 8.0
+    # Corridor seeding for initial population: lateral jitter around the
+    # flight-path centreline when placing a wall-like obstacle head-on.
+    corridorSigma: float = 2.0
 
     # Post-GA refinement.
     refineFraction: float = 0.10
@@ -256,6 +259,50 @@ def randomIndividual(
         if not invalidLayout(cfg, obstacles):
             break
     return Individual(obstacles=obstacles)
+
+
+def corridorObstacle(
+    rng: random.Random,
+    cfg: GAConfig,
+    waypoints: List[Waypoint],
+):
+    # Place an obstacle that walls off the drone's path head-on: centre on a
+    # random point along a path segment, rotate to face the approach direction,
+    # add small lateral jitter so it is not always exactly on the centreline.
+    i = rng.randrange(len(waypoints) - 1)
+    a, b = waypoints[i], waypoints[i + 1]
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    segLen = math.hypot(dx, dy)
+    if segLen < 1e-6:
+        return randomObstacle(rng, cfg, waypoints)
+    ux, uy = dx / segLen, dy / segLen   # unit vector along segment
+    px, py = -uy, ux                    # unit vector perpendicular to segment
+    t = rng.random()
+    cx = a[0] + t * dx
+    cy = a[1] + t * dy
+    lateralOffset = rng.gauss(0.0, cfg.corridorSigma)
+    x = clamp(cx + lateralOffset * px, cfg.xMin, cfg.xMax)
+    y = clamp(cy + lateralOffset * py, cfg.yMin, cfg.yMax)
+    # Rotate so the obstacle face is perpendicular to the approach direction;
+    # mod 90 keeps r within [0, 90) regardless of segment orientation.
+    r = clamp(math.degrees(math.atan2(dy, dx)) % 90.0, cfg.rMin, cfg.rMax)
+    size = Obstacle.Size(l=rng.uniform(cfg.lMin, cfg.lMax), w=rng.uniform(cfg.wMin, cfg.wMax), h=cfg.hFixed)
+    return Obstacle(size, Obstacle.Position(x=x, y=y, z=0, r=r))
+
+
+def seededIndividual(
+    rng: random.Random,
+    cfg: GAConfig,
+    waypoints: List[Waypoint],
+):
+    # Uses corridorObstacle for placement; falls back to randomIndividual if
+    # the corridor placement cannot pass the layout check after maxRetries.
+    n = rng.randint(1, cfg.maxObstacles)
+    for _ in range(cfg.maxRetries):
+        obstacles = [corridorObstacle(rng, cfg, waypoints) for _ in range(n)]
+        if not invalidLayout(cfg, obstacles):
+            return Individual(obstacles=obstacles)
+    return randomIndividual(rng, cfg, waypoints)
 
 
 def crossover(rng: random.Random, a: Individual, b: Individual):
@@ -541,7 +588,12 @@ class GeneticGenerator:
         goalXY = self.waypoints[-1] if len(self.waypoints) >= 2 else None
         maxGoodDuration = 0.0
 
-        pop = [randomIndividual(self.rng, cfg, self.waypoints) for _ in range(cfg.popSize)]
+        useCorridorSeed = len(self.waypoints) >= 2
+        pop = [
+            seededIndividual(self.rng, cfg, self.waypoints) if useCorridorSeed
+            else randomIndividual(self.rng, cfg, self.waypoints)
+            for _ in range(cfg.popSize)
+        ]
         evaluated: List[Individual] = []
         simsUsed = 0
         gen = 0
