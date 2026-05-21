@@ -1,4 +1,5 @@
 FROM skhatiri/aerialist:latest
+RUN apt-get update && apt-get install -y --no-install-recommends xvfb && rm -rf /var/lib/apt/lists/*
 RUN pip3 install -e /src/aerialist/ lz4
 
 RUN wget https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz && \
