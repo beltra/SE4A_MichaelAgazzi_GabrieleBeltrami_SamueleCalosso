@@ -59,6 +59,10 @@ class GAConfig:
     meanWeight: float = 0.1
     countWeight: float = 0.05
     varianceWeight: float = 0.2
+    # Continuous pull toward lower distances; provides gradient in the tier-0
+    # zone (dist >= 1.5 m) where tierPoints is flat at 0.  Bounded in (-1, 0],
+    # so it cannot outweigh a genuine tier promotion.
+    continuousWeight: float = 1.0
 
     # Path-aware seeding.
     pathBiasProb: float = 0.8
@@ -165,6 +169,7 @@ def fitnessFor(cfg: GAConfig, distances: List[float], obstacleCount: int, stuck:
     stdD = statistics.stdev(distances) if len(distances) > 1 else 0.0
     return (
         -tierPoints(meanD)
+        - cfg.continuousWeight / (1.0 + meanD)
         - (cfg.stuckBonus if stuck else 0.0)
         + cfg.meanWeight * meanD
         + cfg.countWeight * obstacleCount
