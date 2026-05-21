@@ -63,24 +63,18 @@ echo "========================================"
 RUNNING=$(docker compose -f "$COMPOSE_FILE" ps -q "$SERVICE_NAME")
 FRESH_START=false
 
+# Set X11 permissions
+if command -v xhost >/dev/null 2>&1; then
+    xhost +local:docker || true
+fi
+
 if [ "$REBUILD" = true ]; then
     echo "Rebuilding image..."
     docker compose -f "$COMPOSE_FILE" down
-    if command -v xhost >/dev/null 2>&1; then
-        xhost +local:docker || true
-    fi
     docker compose -f "$COMPOSE_FILE" up -d --build
     FRESH_START=true
 elif [ -z "$RUNNING" ]; then
     echo "Container not running. Ensuring it exists..."
-
-    # Grant X server access for Gazebo GUI
-    if command -v xhost >/dev/null 2>&1; then
-        xhost +local:docker || true
-    fi
-
-    # Start the container in detached mode.
-    # --no-recreate ensures we don't destroy an existing stopped container.
     docker compose -f "$COMPOSE_FILE" up -d --no-recreate
     FRESH_START=true
 else

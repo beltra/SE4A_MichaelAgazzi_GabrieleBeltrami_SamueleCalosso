@@ -1,12 +1,15 @@
 """Minimalist single-file genetic algorithm for PX4 Aerialist obstacle tests."""
 
 import copy
+import glob
 import json
 import logging
 import math
+import os
 import random
 import statistics
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from typing import List, Optional, Tuple
@@ -58,17 +61,30 @@ class GAConfig:
     varianceWeight: float = 0.2
 
     # Path-aware seeding.
-    pathBiasProb: float = 0.7
+    pathBiasProb: float = 0.8
     pathSigma: float = 8.0
 
     # Post-GA refinement.
-    refineFraction: float = 0.25
+    refineFraction: float = 0.10
     refineThreshold: float = 1.5
     nReruns: int = 4
     failSentinel: float = 5.0
 
     # Top-K obstacle-centroid diversity filter.
     diversityMinM: float = 10.0
+
+    # Stuck-avoidance detection: drone is "stuck" if its final trajectory point
+    # is farther than goalTol from the last mission waypoint. The watchdog
+    # kills runs that exceed timeoutMul * (slowest reached-goal run so far),
+    # with minTimeout as the floor before any good run has been observed.
+    # stuckBonus is subtracted from fitness on stuck candidates: an SUT that
+    # fails to complete the mission is itself a defect we want surfaced, so
+    # we make these competitive with a tier-2 obstacle hit without dominating
+    # a tier-5 one (the official scorer only rewards obstacle proximity).
+    goalTol: float = 5.0
+    timeoutMul: float = 2.5
+    minTimeout: float = 300.0
+    stuckBonus: float = 2.0
 
 
 Waypoint = Tuple[float, float]
@@ -81,6 +97,8 @@ class Individual:
     testCase: Optional[TestCase] = None
     valid: bool = False
     distances: List[float] = field(default_factory=list)
+    stuck: bool = False
+    duration: float = 0.0
 
 
 def clamp(v: float, lo: float, hi: float):
@@ -115,6 +133,26 @@ def hasOverlap(obstacles: List[Obstacle]):
     return False
 
 
+def fitsInBounds(cfg: GAConfig, obstacles: List[Obstacle]):
+    # Wiki says obstacles must fit in the case-study rectangle; clamping only
+    # the centre lets a rotated 20m box at y=10 reach down to y~1, i.e. right
+    # on the takeoff point, which traps the avoidance planner.
+    for o in obstacles:
+        hx, hy = rotatedHalfExtents(o.size.l, o.size.w, o.position.r)
+        if (
+            o.position.x - hx < cfg.xMin
+            or o.position.x + hx > cfg.xMax
+            or o.position.y - hy < cfg.yMin
+            or o.position.y + hy > cfg.yMax
+        ):
+            return False
+    return True
+
+
+def invalidLayout(cfg: GAConfig, obstacles: List[Obstacle]):
+    return hasOverlap(obstacles) or not fitsInBounds(cfg, obstacles)
+
+
 def tierPoints(d: float):
     for b, p in zip(TIER_BOUNDS, TIER_POINTS[:-1]):
         if d < b:
@@ -122,11 +160,12 @@ def tierPoints(d: float):
     return TIER_POINTS[-1]
 
 
-def fitnessFor(cfg: GAConfig, distances: List[float], obstacleCount: int):
+def fitnessFor(cfg: GAConfig, distances: List[float], obstacleCount: int, stuck: bool = False):
     meanD = sum(distances) / len(distances)
     stdD = statistics.stdev(distances) if len(distances) > 1 else 0.0
     return (
         -tierPoints(meanD)
+        - (cfg.stuckBonus if stuck else 0.0)
         + cfg.meanWeight * meanD
         + cfg.countWeight * obstacleCount
         + cfg.varianceWeight * stdD
@@ -159,6 +198,17 @@ def parseWaypoints(planPath: str):
     except Exception as e:
         logger.warning("waypoint parse failed: %s", e)
         return [(0.0, 0.0)]
+
+
+def reachedGoal(trajectory, goalXY: Waypoint, tol: float):
+    # Trajectory.positions may be empty when ALLIGN_ORIGIN runs against a
+    # truncated log; treat missing data as "did not reach" so the watchdog
+    # path and the unfinished-flight path collapse into the same flag.
+    positions = getattr(trajectory, "positions", None) if trajectory is not None else None
+    if not positions:
+        return False
+    last = positions[-1]
+    return math.hypot(last.x - goalXY[0], last.y - goalXY[1]) <= tol
 
 
 def anchorOnPath(rng: random.Random, waypoints: List[Waypoint]):
@@ -198,7 +248,7 @@ def randomIndividual(
     obstacles: List[Obstacle] = []
     for _ in range(cfg.maxRetries):
         obstacles = [randomObstacle(rng, cfg, waypoints) for _ in range(n)]
-        if not hasOverlap(obstacles):
+        if not invalidLayout(cfg, obstacles):
             break
     return Individual(obstacles=obstacles)
 
@@ -260,24 +310,78 @@ def tournament(rng: random.Random, cfg: GAConfig, pop: List[Individual]):
     return min(contenders, key=lambda i: i.fitness)
 
 
-_CLEANUP_PATTERNS = ("mavsdk_server", "px4", "gzserver", "gzclient", "roslaunch", "nodelet")
+# Anything spawned by roslaunch inherits the pipe write end Aerialist polls on;
+# if rosmaster / mavros / rosout survive a SIGKILL of roslaunch, sim_thread's
+# readlines() on the child stdout blocks forever and the GA hangs. Mirror
+# kill_simulations.sh (minus "python3 cli.py", which would kill us).
+_CLEANUP_PATTERNS = (
+    "mavsdk_server",
+    "px4",
+    "gzserver",
+    "gzclient",
+    "gazebo",
+    "roslaunch",
+    "rosmaster",
+    "rosout",
+    "robot_state_publisher",
+    "static_transform_publisher",
+    "nodelet",
+    "mavros",
+    "mavros_node",
+)
+_STALE_GLOBS = ("/tmp/px4-sock-*", "/tmp/px4_lock-*")
 
 
 def cleanupSimState():
-    for pattern in _CLEANUP_PATTERNS:
-        subprocess.run(
-            ["pkill", "-9", "-f", pattern],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    time.sleep(1)
+    # SIGTERM first so processes flush stdout and release pipes cleanly;
+    # SIGKILL the survivors after a brief grace period.
+    for signame in ("-TERM", "-KILL"):
+        for pattern in _CLEANUP_PATTERNS:
+            subprocess.run(
+                ["pkill", signame, "-f", pattern],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        time.sleep(1)
+    # pkill -9 skips PX4's cleanup hook, so its socket and lock file in /tmp
+    # survive the kill and make the next SITL instance exit with code 255.
+    for pattern in _STALE_GLOBS:
+        for path in glob.glob(pattern):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
-def evaluate(cfg: GAConfig, ind: Individual, caseStudy: AerialistTest):
-    if hasOverlap(ind.obstacles):
+def armWatchdog(killAfter: float):
+    # Returns (timer, killedFlag). The flag is a 1-element list so the timer
+    # callback can mutate it without a nonlocal binding; cleanupSimState pkills
+    # PX4/Gazebo which unblocks agent.run() with an exception.
+    if killAfter <= 0:
+        return None, [False]
+    killed = [False]
+    def watchdog():
+        killed[0] = True
+        cleanupSimState()
+    timer = threading.Timer(killAfter, watchdog)
+    timer.daemon = True
+    timer.start()
+    return timer, killed
+
+
+def evaluate(
+    cfg: GAConfig,
+    ind: Individual,
+    caseStudy: AerialistTest,
+    goalXY: Optional[Waypoint] = None,
+    killAfter: float = 0.0,
+):
+    if invalidLayout(cfg, ind.obstacles):
         ind.fitness = float("inf")
         ind.valid = False
         return False
+    timer, killed = armWatchdog(killAfter)
+    t0 = time.monotonic()
     try:
         tc = TestCase(caseStudy, ind.obstacles)
         tc.execute()
@@ -290,18 +394,36 @@ def evaluate(cfg: GAConfig, ind: Individual, caseStudy: AerialistTest):
         tc.plot()
         ind.testCase = tc
         ind.distances.append(minDist)
-        ind.fitness = fitnessFor(cfg, ind.distances, len(ind.obstacles))
+        if goalXY is not None and not reachedGoal(tc.trajectory, goalXY, cfg.goalTol):
+            ind.stuck = True
+            logger.info("stuck: final trajectory point not within %.1fm of goal", cfg.goalTol)
+        ind.fitness = fitnessFor(cfg, ind.distances, len(ind.obstacles), ind.stuck)
         ind.valid = True
     except Exception as e:
-        logger.warning("sim failed: %s", e)
+        if killed[0]:
+            ind.stuck = True
+            logger.info("stuck: watchdog killed run after %.1fs", time.monotonic() - t0)
+        else:
+            logger.warning("sim failed: %s", e)
         ind.fitness = float("inf")
         ind.valid = False
     finally:
+        if timer is not None:
+            timer.cancel()
+        ind.duration = time.monotonic() - t0
         cleanupSimState()
     return True
 
 
-def rerun(cfg: GAConfig, ind: Individual, caseStudy: AerialistTest):
+def rerun(
+    cfg: GAConfig,
+    ind: Individual,
+    caseStudy: AerialistTest,
+    goalXY: Optional[Waypoint] = None,
+    killAfter: float = 0.0,
+):
+    timer, killed = armWatchdog(killAfter)
+    t0 = time.monotonic()
     try:
         tc = TestCase(caseStudy, copy.deepcopy(ind.obstacles))
         tc.execute()
@@ -313,12 +435,22 @@ def rerun(cfg: GAConfig, ind: Individual, caseStudy: AerialistTest):
         tc.plot()
         ind.distances.append(minDist)
         ind.testCase = tc
+        if goalXY is not None and not reachedGoal(tc.trajectory, goalXY, cfg.goalTol):
+            ind.stuck = True
+            logger.info("stuck on rerun: final point not within %.1fm of goal", cfg.goalTol)
     except Exception as e:
-        # A finite sentinel keeps mean/stdev defined, drops the run into the
-        # worthless tier, and inflates variance so flaky candidates rank worse.
-        logger.warning("rerun failed (penalised with sentinel %s): %s", cfg.failSentinel, e)
+        if killed[0]:
+            ind.stuck = True
+            logger.info("stuck on rerun: watchdog killed run after %.1fs", time.monotonic() - t0)
+        else:
+            # A finite sentinel keeps mean/stdev defined, drops the run into the
+            # worthless tier, and inflates variance so flaky candidates rank worse.
+            logger.warning("rerun failed (penalised with sentinel %s): %s", cfg.failSentinel, e)
         ind.distances.append(cfg.failSentinel)
     finally:
+        if timer is not None:
+            timer.cancel()
+        ind.duration = time.monotonic() - t0
         cleanupSimState()
 
 
@@ -339,13 +471,13 @@ def nextGeneration(
                 crossover(rng, tournament(rng, cfg, pop), tournament(rng, cfg, pop)),
                 waypoints,
             )
-            if not hasOverlap(c.obstacles):
+            if not invalidLayout(cfg, c.obstacles):
                 child = c
                 break
         if child is None:
             for _ in range(cfg.maxRetries):
                 c = randomIndividual(rng, cfg, waypoints)
-                if not hasOverlap(c.obstacles):
+                if not invalidLayout(cfg, c.obstacles):
                     child = c
                     break
         if child is None:
@@ -399,6 +531,11 @@ class GeneticGenerator:
             budget, cfg.popSize, phase1Budget, phase2Budget,
         )
 
+        # Goal == last mission waypoint; parseWaypoints falls back to [(0,0)]
+        # when the .plan is missing, in which case we cannot detect "stuck".
+        goalXY = self.waypoints[-1] if len(self.waypoints) >= 2 else None
+        maxGoodDuration = 0.0
+
         pop = [randomIndividual(self.rng, cfg, self.waypoints) for _ in range(cfg.popSize)]
         evaluated: List[Individual] = []
         simsUsed = 0
@@ -407,9 +544,14 @@ class GeneticGenerator:
             for ind in pop:
                 if ind.valid:
                     continue
-                consumed = evaluate(cfg, ind, self.caseStudy)
+                killAfter = max(cfg.minTimeout, cfg.timeoutMul * maxGoodDuration)
+                consumed = evaluate(cfg, ind, self.caseStudy, goalXY, killAfter)
                 if ind.valid:
                     evaluated.append(ind)
+                    # Only reached-goal runs feed the threshold; otherwise a slow
+                    # stuck run would inflate the budget and disarm the watchdog.
+                    if not ind.stuck and ind.duration > maxGoodDuration:
+                        maxGoodDuration = ind.duration
                 if consumed:
                     simsUsed += 1
                 if simsUsed >= phase1Budget:
@@ -431,12 +573,13 @@ class GeneticGenerator:
             if simsLeft <= 0:
                 break
             nMore = min(cfg.nReruns, simsLeft)
+            killAfter = max(cfg.minTimeout, cfg.timeoutMul * maxGoodDuration)
             for _ in range(nMore):
-                rerun(cfg, cand, self.caseStudy)
+                rerun(cfg, cand, self.caseStudy, goalXY, killAfter)
                 simsLeft -= 1
                 if simsLeft <= 0:
                     break
-            cand.fitness = fitnessFor(cfg, cand.distances, len(cand.obstacles))
+            cand.fitness = fitnessFor(cfg, cand.distances, len(cand.obstacles), cand.stuck)
             meanD = sum(cand.distances) / len(cand.distances)
             logger.info(
                 "refined: runs=%d mean=%.2f fitness=%.2f",

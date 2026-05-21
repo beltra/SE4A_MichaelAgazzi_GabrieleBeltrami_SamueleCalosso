@@ -11,7 +11,7 @@ if [[ "${1:-}" == "--dry-run" ]]; then
 fi
 
 PATTERNS=(
-  "python3 main.py"
+  "python3 cli.py"
   "px4"
   "px4_sitl"
   "sitl_run"
