@@ -65,7 +65,6 @@ class GAConfig:
     continuousWeight: float = 1.0
 
     # Path-aware seeding.
-    pathBiasProb: float = 0.8
     pathSigma: float = 8.0
     # Corridor seeding for initial population: lateral jitter around the
     # flight-path centreline when placing a wall-like obstacle head-on.
