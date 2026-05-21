@@ -62,7 +62,31 @@ def config_loggers():
     root.addHandler(f_handler)
 
 
+def _ensure_virtual_display() -> None:
+    import subprocess
+    display = os.environ.get("DISPLAY", "")
+    if display.startswith(":"):
+        return
+    if os.environ.get("AERIALIST_VIRTUAL_DISPLAY") == "started":
+        return
+    try:
+        subprocess.Popen(
+            ["Xvfb", ":99", "-screen", "0", "1280x720x24"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = ":99"
+        os.environ["LIBGL_ALWAYS_INDIRECT"] = "0"
+        os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
+        os.environ["AERIALIST_VIRTUAL_DISPLAY"] = "started"
+    except FileNotFoundError:
+        pass
+
+
 if __name__ == "__main__":
+    import patchAerialist
+    patchAerialist.applyPatches()
+    _ensure_virtual_display()
     config_loggers()
     try:
         args = arg_parse()
