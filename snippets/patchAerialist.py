@@ -1,10 +1,13 @@
 """Idempotent patches applied at container startup.
 
-Both patches must run before any Aerialist simulator is built:
+All three patches must run before any Aerialist simulator is built:
   1. PX4 SITL would block on stdin without `interactive:=false`, so subprocess
      launches exit immediately.
   2. Aerialist's ROS branch does not export `PX4_SIM_SPEED_FACTOR`, which makes
      `simulation.speed` from the mission YAML a no-op for that backend.
+  3. drone.py connect_async only waits for is_global_position_ok; PX4 also
+     requires home position before arming, so arm() returns COMMAND_DENIED
+     unless we also wait for is_home_position_ok.
 """
 
 import os
@@ -13,6 +16,7 @@ import sys
 
 LAUNCH_PATH = "/src/aerialist/aerialist/resources/simulation/collision_prevention.launch"
 SIMULATOR_PATH = "/src/aerialist/aerialist/px4/simulator.py"
+DRONE_PATH = "/src/aerialist/aerialist/px4/drone.py"
 
 LAUNCH_OLD = (
     '    <include file="$(find px4)/launch/px4.launch">\n'
@@ -31,6 +35,18 @@ SIM_MARKER = 'sim_command += f"export PX4_SIM_SPEED_FACTOR={self.config.speed};'
 SIM_EXPORT = (
     "            if self.config.speed != 1:\n"
     '                sim_command += f"export PX4_SIM_SPEED_FACTOR={self.config.speed}; "\n'
+)
+
+DRONE_MARKER = "is_home_position_ok"
+DRONE_OLD = (
+    "        # Checking if Global Position Estimate is ok\n"
+    "        async for global_lock in self.drone.telemetry.health():\n"
+    "            if global_lock.is_global_position_ok:\n"
+)
+DRONE_NEW = (
+    "        # Checking if Global Position Estimate is ok\n"
+    "        async for global_lock in self.drone.telemetry.health():\n"
+    "            if global_lock.is_global_position_ok and global_lock.is_home_position_ok:\n"
 )
 
 
@@ -62,9 +78,24 @@ def patchSimulator() -> str:
     return "simulator: patched"
 
 
+def patchDrone() -> str:
+    if not os.path.exists(DRONE_PATH):
+        return f"drone: missing ({DRONE_PATH})"
+    with open(DRONE_PATH) as fh:
+        text = fh.read()
+    if DRONE_MARKER in text:
+        return "drone: already patched"
+    if DRONE_OLD not in text:
+        return "drone: anchor not found"
+    with open(DRONE_PATH, "w") as fh:
+        fh.write(text.replace(DRONE_OLD, DRONE_NEW, 1))
+    return "drone: patched"
+
+
 def applyPatches() -> None:
     print(patchLaunch())
     print(patchSimulator())
+    print(patchDrone())
 
 
 if __name__ == "__main__":
