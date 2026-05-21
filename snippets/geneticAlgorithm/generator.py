@@ -226,23 +226,29 @@ def anchorOnPath(rng: random.Random, waypoints: List[Waypoint]):
     return (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
 
 
+def sizeTierBounds(lo: float, hi: float, idx: int):
+    # Lower bound rises with lower idx; upper bound is always hi.
+    # idx 0: [lo+2*step, hi], idx 1: [lo+step, hi], idx 2+: [lo, hi]
+    step = (hi - lo) / 3.0
+    return lo + (2 - min(idx, 2)) * step, hi
+
+
 def randomObstacle(
     rng: random.Random,
     cfg: GAConfig,
     waypoints: Optional[List[Waypoint]] = None,
+    idx: int = 0,
 ):
-    if waypoints is not None and len(waypoints) >= 2 and rng.random() < cfg.pathBiasProb:
+    if waypoints is not None and len(waypoints) >= 2:
         ax, ay = anchorOnPath(rng, waypoints)
         x = clamp(ax + rng.gauss(0, cfg.pathSigma), cfg.xMin, cfg.xMax)
         y = clamp(ay + rng.gauss(0, cfg.pathSigma), cfg.yMin, cfg.yMax)
     else:
         x = rng.uniform(cfg.xMin, cfg.xMax)
         y = rng.uniform(cfg.yMin, cfg.yMax)
-    size = Obstacle.Size(
-        l=rng.uniform(cfg.lMin, cfg.lMax),
-        w=rng.uniform(cfg.wMin, cfg.wMax),
-        h=cfg.hFixed,
-    )
+    lLo, lHi = sizeTierBounds(cfg.lMin, cfg.lMax, idx)
+    wLo, wHi = sizeTierBounds(cfg.wMin, cfg.wMax, idx)
+    size = Obstacle.Size(l=rng.uniform(lLo, lHi), w=rng.uniform(wLo, wHi), h=cfg.hFixed)
     position = Obstacle.Position(x=x, y=y, z=0, r=rng.uniform(cfg.rMin, cfg.rMax))
     return Obstacle(size, position)
 
@@ -255,7 +261,7 @@ def randomIndividual(
     n = rng.randint(1, cfg.maxObstacles)
     obstacles: List[Obstacle] = []
     for _ in range(cfg.maxRetries):
-        obstacles = [randomObstacle(rng, cfg, waypoints) for _ in range(n)]
+        obstacles = [randomObstacle(rng, cfg, waypoints, idx) for idx in range(n)]
         if not invalidLayout(cfg, obstacles):
             break
     return Individual(obstacles=obstacles)
@@ -265,6 +271,7 @@ def corridorObstacle(
     rng: random.Random,
     cfg: GAConfig,
     waypoints: List[Waypoint],
+    idx: int = 0,
 ):
     # Place an obstacle that walls off the drone's path head-on: centre on a
     # random point along a path segment, rotate to face the approach direction,
@@ -286,7 +293,9 @@ def corridorObstacle(
     # Rotate so the obstacle face is perpendicular to the approach direction;
     # mod 90 keeps r within [0, 90) regardless of segment orientation.
     r = clamp(math.degrees(math.atan2(dy, dx)) % 90.0, cfg.rMin, cfg.rMax)
-    size = Obstacle.Size(l=rng.uniform(cfg.lMin, cfg.lMax), w=rng.uniform(cfg.wMin, cfg.wMax), h=cfg.hFixed)
+    lLo, lHi = sizeTierBounds(cfg.lMin, cfg.lMax, idx)
+    wLo, wHi = sizeTierBounds(cfg.wMin, cfg.wMax, idx)
+    size = Obstacle.Size(l=rng.uniform(lLo, lHi), w=rng.uniform(wLo, wHi), h=cfg.hFixed)
     return Obstacle(size, Obstacle.Position(x=x, y=y, z=0, r=r))
 
 
@@ -299,7 +308,7 @@ def seededIndividual(
     # the corridor placement cannot pass the layout check after maxRetries.
     n = rng.randint(1, cfg.maxObstacles)
     for _ in range(cfg.maxRetries):
-        obstacles = [corridorObstacle(rng, cfg, waypoints) for _ in range(n)]
+        obstacles = [corridorObstacle(rng, cfg, waypoints, idx) for idx in range(n)]
         if not invalidLayout(cfg, obstacles):
             return Individual(obstacles=obstacles)
     return randomIndividual(rng, cfg, waypoints)
@@ -351,7 +360,7 @@ def mutate(
             Obstacle.Position(x=x, y=y, z=0, r=r),
         )
     if rng.random() < cfg.addProb and len(ind.obstacles) < cfg.maxObstacles:
-        ind.obstacles.append(randomObstacle(rng, cfg, waypoints))
+        ind.obstacles.append(randomObstacle(rng, cfg, waypoints, len(ind.obstacles)))
     if rng.random() < cfg.removeProb and len(ind.obstacles) > 1:
         ind.obstacles.pop(rng.randrange(len(ind.obstacles)))
     return ind
