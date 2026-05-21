@@ -71,7 +71,7 @@ if __name__ == "__main__":
 
         ### copying the test cases to the output folder
         tests_fld = f'{TESTS_FOLDER}{datetime.now().strftime("%d-%m-%H-%M-%S")}/'
-        os.mkdir(tests_fld)
+        os.makedirs(tests_fld, exist_ok=True)
         for i in range(len(test_cases)):
             test_cases[i].save_yaml(f"{tests_fld}/test_{i}.yaml")
             shutil.copy2(test_cases[i].log_file, f"{tests_fld}/test_{i}.ulg")
