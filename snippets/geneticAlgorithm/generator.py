@@ -26,6 +26,15 @@ logger = logging.getLogger(__name__)
 TIER_BOUNDS = (0.25, 1.0, 1.5)
 TIER_POINTS = (5, 2, 1, 0)
 
+# Side of the trajectory an obstacle sits on. With the trajectory unit vector
+# (ux, uy) the perpendicular (-uy, ux) is a 90deg CCW rotation, i.e. LEFT of
+# the drone's forward direction; the opposite perpendicular is RIGHT.
+SIDE_LEFT = "L"
+SIDE_RIGHT = "R"
+
+# Uniform lateral offset bound (metres) used when placing corridor obstacles.
+LATERAL_MAX_M = 10.0
+
 
 @dataclass
 class GAConfig:
@@ -66,9 +75,6 @@ class GAConfig:
 
     # Path-aware seeding.
     pathSigma: float = 8.0
-    # Corridor seeding for initial population: lateral jitter around the
-    # flight-path centreline when placing a wall-like obstacle head-on.
-    corridorSigma: float = 2.0
 
     # Post-GA refinement.
     refineFraction: float = 0.10
@@ -369,15 +375,36 @@ def randomIndividual(
     return Individual(obstacles=obstacles)
 
 
+def oppositeSide(s: str):
+    return SIDE_RIGHT if s == SIDE_LEFT else SIDE_LEFT
+
+
+def sideSchedule(rng: random.Random, n: int):
+    # First obstacle picks a random side; the second is forced opposite so
+    # the GA does not pile both onto the same flank (which the logs showed
+    # was the main failure mode of the previous seeding). The third, when
+    # present, is random again so both sides keep getting explored.
+    if n == 1:
+        return [rng.choice([SIDE_LEFT, SIDE_RIGHT])]
+    if n == 2:
+        first = rng.choice([SIDE_LEFT, SIDE_RIGHT])
+        return [first, oppositeSide(first)]
+    if n == 3:
+        first = rng.choice([SIDE_LEFT, SIDE_RIGHT])
+        return [first, oppositeSide(first), rng.choice([SIDE_LEFT, SIDE_RIGHT])]
+    return []
+
+
 def corridorObstacle(
     rng: random.Random,
     cfg: GAConfig,
     waypoints: List[Waypoint],
     idx: int = 0,
+    side: str = SIDE_LEFT,
 ):
-    # Place an obstacle that walls off the drone's path head-on: centre on a
-    # random point along a path segment, rotate to face the approach direction,
-    # add small lateral jitter so it is not always exactly on the centreline.
+    # Place an obstacle alongside the drone's path: centre on a random point
+    # along a path segment, push it laterally onto the chosen side with a
+    # uniform offset, then rotate to face the approach direction.
     i = rng.randrange(len(waypoints) - 1)
     a, b = waypoints[i], waypoints[i + 1]
     dx, dy = b[0] - a[0], b[1] - a[1]
@@ -385,11 +412,12 @@ def corridorObstacle(
     if segLen < 1e-6:
         return randomObstacle(rng, cfg, waypoints)
     ux, uy = dx / segLen, dy / segLen   # unit vector along segment
-    px, py = -uy, ux                    # unit vector perpendicular to segment
+    px, py = -uy, ux                    # +perpendicular = LEFT of forward direction
     t = rng.random()
     cx = a[0] + t * dx
     cy = a[1] + t * dy
-    lateralOffset = rng.gauss(0.0, cfg.corridorSigma)
+    sign = 1.0 if side == SIDE_LEFT else -1.0
+    lateralOffset = sign * rng.uniform(0.0, LATERAL_MAX_M)
     x = clamp(cx + lateralOffset * px, cfg.xMin, cfg.xMax)
     y = clamp(cy + lateralOffset * py, cfg.yMin, cfg.yMax)
     # Rotate so the obstacle face is perpendicular to the approach direction;
@@ -411,8 +439,12 @@ def seededIndividual(
     # the corridor placement cannot pass the layout check after maxRetries.
     if n is None:
         n = rng.randint(1, cfg.maxObstacles)
+    sides = sideSchedule(rng, n)
     for _ in range(cfg.maxRetries):
-        obstacles = [corridorObstacle(rng, cfg, waypoints, idx) for idx in range(n)]
+        obstacles = [
+            corridorObstacle(rng, cfg, waypoints, idx, sides[idx])
+            for idx in range(n)
+        ]
         if not invalidLayout(cfg, obstacles):
             return Individual(obstacles=obstacles)
         if n > 1:
