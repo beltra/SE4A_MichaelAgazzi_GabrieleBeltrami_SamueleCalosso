@@ -32,6 +32,12 @@ TIER_POINTS = (5, 2, 1, 0)
 SIDE_LEFT = "L"
 SIDE_RIGHT = "R"
 
+# Longitudinal half of the segment an obstacle sits on. F (front) places the
+# obstacle closer to the segment destination (drone's forward direction);
+# R (rear) places it closer to the origin.
+LONG_FRONT = "F"
+LONG_REAR = "R"
+
 # Uniform lateral offset bound (metres) used when placing corridor obstacles.
 LATERAL_MAX_M = 10.0
 
@@ -395,15 +401,37 @@ def sideSchedule(rng: random.Random, n: int):
     return []
 
 
+def oppositeLong(s: str):
+    return LONG_REAR if s == LONG_FRONT else LONG_FRONT
+
+
+def longitudinalSchedule(rng: random.Random, n: int):
+    # First obstacle picks a random half; the second copies it so the pair
+    # crowds the same half (forcing the planner to navigate around a cluster);
+    # the third, when present, is forced opposite so the path has obstacles in
+    # both halves and the drone cannot stay on one easy side of the segment.
+    if n == 1:
+        return [rng.choice([LONG_FRONT, LONG_REAR])]
+    if n == 2:
+        first = rng.choice([LONG_FRONT, LONG_REAR])
+        return [first, first]
+    if n == 3:
+        first = rng.choice([LONG_FRONT, LONG_REAR])
+        return [first, first, oppositeLong(first)]
+    return []
+
+
 def corridorObstacle(
     rng: random.Random,
     cfg: GAConfig,
     waypoints: List[Waypoint],
     idx: int = 0,
     side: str = SIDE_LEFT,
+    longitudinal: str = LONG_FRONT,
 ):
     # Place an obstacle alongside the drone's path: centre on a random point
-    # along a path segment, push it laterally onto the chosen side with a
+    # in the chosen half of a path segment (front = closer to destination,
+    # rear = closer to origin), push it laterally onto the chosen side with a
     # uniform offset, then rotate to face the approach direction.
     i = rng.randrange(len(waypoints) - 1)
     a, b = waypoints[i], waypoints[i + 1]
@@ -413,7 +441,7 @@ def corridorObstacle(
         return randomObstacle(rng, cfg, waypoints)
     ux, uy = dx / segLen, dy / segLen   # unit vector along segment
     px, py = -uy, ux                    # +perpendicular = LEFT of forward direction
-    t = rng.random()
+    t = rng.uniform(0.5, 1.0) if longitudinal == LONG_FRONT else rng.uniform(0.0, 0.5)
     cx = a[0] + t * dx
     cy = a[1] + t * dy
     sign = 1.0 if side == SIDE_LEFT else -1.0
@@ -440,9 +468,10 @@ def seededIndividual(
     if n is None:
         n = rng.randint(1, cfg.maxObstacles)
     sides = sideSchedule(rng, n)
+    longs = longitudinalSchedule(rng, n)
     for _ in range(cfg.maxRetries):
         obstacles = [
-            corridorObstacle(rng, cfg, waypoints, idx, sides[idx])
+            corridorObstacle(rng, cfg, waypoints, idx, sides[idx], longs[idx])
             for idx in range(n)
         ]
         if not invalidLayout(cfg, obstacles):
@@ -451,6 +480,7 @@ def seededIndividual(
             obstacles = resolveOverlaps(cfg, obstacles)
             if not invalidLayout(cfg, obstacles):
                 return Individual(obstacles=obstacles)
+    logger.info("seeded retries exhausted for n=%d, falling back to randomIndividual", n)
     return randomIndividual(rng, cfg, waypoints, n)
 
 

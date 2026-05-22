@@ -66,8 +66,6 @@ if ($LASTEXITCODE -ne 0) {
     throw "Failed to query Docker Compose service state."
 }
 
-$freshStart = $false
-
 if ($Rebuild) {
     Write-Host "Rebuilding image..."
     docker compose -f $composeFile down
@@ -79,7 +77,6 @@ if ($Rebuild) {
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to rebuild and start the container."
     }
-    $freshStart = $true
 } elseif ([string]::IsNullOrWhiteSpace($running)) {
     Write-Host "Container not running. Ensuring it exists..."
 
@@ -87,26 +84,11 @@ if ($Rebuild) {
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to start the container."
     }
-    $freshStart = $true
 } else {
     Write-Host "Container is already running. Skipping start..."
 }
 
-# Apply Aerialist source-tree patches once
-if ($freshStart) {
-    Write-Host "Applying Aerialist patches..."
-    docker compose -f $composeFile exec -T $serviceName `
-        /bin/bash -c "cd /src/generator && python3 patchAerialist.py"
-    # Best-effort: ignore failures so an already-patched tree does not abort the run.
-    $LASTEXITCODE = 0
-}
-
 if ($sim) {
-    Write-Host "Killing any leftover simulation processes..."
-    docker compose -f $composeFile exec -T $serviceName `
-        /bin/bash /src/generator/kill_simulations.sh
-    $LASTEXITCODE = 0
-
     $argsString = $simArgs -join ' '
     $cmd = "cd /src/generator && python3 cli.py $argsString"
     Write-Host "Running inside container: $cmd"

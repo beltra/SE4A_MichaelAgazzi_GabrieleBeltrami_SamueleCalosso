@@ -63,6 +63,14 @@ def config_loggers():
 
 
 def _ensure_virtual_display() -> None:
+    """Start Xvfb when DISPLAY is remote or unset.
+
+    On Windows, DISPLAY is forwarded as host.docker.internal:0.0 (a remote X11
+    address). Gazebo's depth-camera plugin needs a real OpenGL context; with
+    LIBGL_ALWAYS_INDIRECT the plugin either hangs or fails to initialise, which
+    prevents PX4 from completing its prearm checks, causing arm() to return
+    COMMAND_DENIED. Starting a local Xvfb with software Mesa avoids the issue.
+    """
     import subprocess
     display = os.environ.get("DISPLAY", "")
     if display.startswith(":"):
@@ -79,8 +87,9 @@ def _ensure_virtual_display() -> None:
         os.environ["LIBGL_ALWAYS_INDIRECT"] = "0"
         os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
         os.environ["AERIALIST_VIRTUAL_DISPLAY"] = "started"
+        print("virtual display: started Xvfb on :99 with software OpenGL")
     except FileNotFoundError:
-        pass
+        print("virtual display: Xvfb not found, keeping DISPLAY=" + display)
 
 
 if __name__ == "__main__":
