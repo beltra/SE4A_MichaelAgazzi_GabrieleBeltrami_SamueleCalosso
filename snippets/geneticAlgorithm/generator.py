@@ -159,6 +159,96 @@ def invalidLayout(cfg: GAConfig, obstacles: List[Obstacle]):
     return hasOverlap(obstacles) or not fitsInBounds(cfg, obstacles)
 
 
+def shiftObstacle(o: Obstacle, dx: float, dy: float):
+    return Obstacle(
+        Obstacle.Size(l=o.size.l, w=o.size.w, h=o.size.h),
+        Obstacle.Position(
+            x=o.position.x + dx, y=o.position.y + dy,
+            z=o.position.z, r=o.position.r,
+        ),
+    )
+
+
+def shrinkObstacle(cfg: GAConfig, o: Obstacle):
+    # Halve the footprint, clamped to lMin/wMin so the obstacle stays valid
+    # geometry even after several shrink steps.
+    return Obstacle(
+        Obstacle.Size(
+            l=max(cfg.lMin, o.size.l * 0.5),
+            w=max(cfg.wMin, o.size.w * 0.5),
+            h=o.size.h,
+        ),
+        o.position,
+    )
+
+
+def mtv(a: Obstacle, b: Obstacle):
+    # Minimum translation vector along the centre-to-centre line, computed on
+    # the rotated AABBs. Returns (dx, dy) pointing from a to b with length
+    # equal to the penetration; (0, 0) when the AABBs do not overlap.
+    hxA, hyA = rotatedHalfExtents(a.size.l, a.size.w, a.position.r)
+    hxB, hyB = rotatedHalfExtents(b.size.l, b.size.w, b.position.r)
+    cx = b.position.x - a.position.x
+    cy = b.position.y - a.position.y
+    dist = math.hypot(cx, cy)
+    if dist < 1e-9:
+        # Coincident centres: pick +x as a stable separation direction.
+        ux, uy = 1.0, 0.0
+        dist = 0.0
+    else:
+        ux, uy = cx / dist, cy / dist
+    needed = (hxA + hxB) * abs(ux) + (hyA + hyB) * abs(uy)
+    penetration = needed - dist
+    if penetration <= 0.0:
+        return 0.0, 0.0
+    return ux * penetration, uy * penetration
+
+
+def findOverlapPair(obstacles: List[Obstacle]):
+    for i in range(len(obstacles)):
+        for j in range(i + 1, len(obstacles)):
+            dx, dy = mtv(obstacles[i], obstacles[j])
+            if dx != 0.0 or dy != 0.0:
+                return i, j
+    return None
+
+
+def separatePair(cfg: GAConfig, a: Obstacle, b: Obstacle, delta: float = 1.0):
+    # Push a and b apart along the centre-to-centre line by MTV/2 each, plus
+    # delta/2 each of slack so the final gap is "penetration + delta" past
+    # touching. Returns None when either obstacle would leave the play area.
+    dx, dy = mtv(a, b)
+    if dx == 0.0 and dy == 0.0:
+        return a, b
+    pen = math.hypot(dx, dy)
+    ux, uy = dx / pen, dy / pen
+    half = (pen + delta) * 0.5
+    newA = shiftObstacle(a, -ux * half, -uy * half)
+    newB = shiftObstacle(b, ux * half, uy * half)
+    if not fitsInBounds(cfg, [newA, newB]):
+        return None
+    return newA, newB
+
+
+def resolveOverlaps(cfg: GAConfig, obstacles: List[Obstacle], maxIter: int = 6):
+    # Move overlapping pairs apart with separatePair; if a move would push an
+    # obstacle out of bounds, shrink both obstacles (l, w *= 0.5) and try again.
+    # Capped by maxIter to guarantee termination at min footprint.
+    obs = list(obstacles)
+    for _ in range(maxIter):
+        pair = findOverlapPair(obs)
+        if pair is None:
+            return obs
+        i, j = pair
+        moved = separatePair(cfg, obs[i], obs[j])
+        if moved is not None:
+            obs[i], obs[j] = moved
+        else:
+            obs[i] = shrinkObstacle(cfg, obs[i])
+            obs[j] = shrinkObstacle(cfg, obs[j])
+    return obs
+
+
 def tierPoints(d: float):
     for b, p in zip(TIER_BOUNDS, TIER_POINTS[:-1]):
         if d < b:
@@ -262,7 +352,11 @@ def randomIndividual(
     for _ in range(cfg.maxRetries):
         obstacles = [randomObstacle(rng, cfg, waypoints, idx) for idx in range(n)]
         if not invalidLayout(cfg, obstacles):
-            break
+            return Individual(obstacles=obstacles)
+        if n > 1:
+            obstacles = resolveOverlaps(cfg, obstacles)
+            if not invalidLayout(cfg, obstacles):
+                return Individual(obstacles=obstacles)
     return Individual(obstacles=obstacles)
 
 
@@ -310,6 +404,10 @@ def seededIndividual(
         obstacles = [corridorObstacle(rng, cfg, waypoints, idx) for idx in range(n)]
         if not invalidLayout(cfg, obstacles):
             return Individual(obstacles=obstacles)
+        if n > 1:
+            obstacles = resolveOverlaps(cfg, obstacles)
+            if not invalidLayout(cfg, obstacles):
+                return Individual(obstacles=obstacles)
     return randomIndividual(rng, cfg, waypoints)
 
 
@@ -362,6 +460,10 @@ def mutate(
         ind.obstacles.append(randomObstacle(rng, cfg, waypoints, len(ind.obstacles)))
     if rng.random() < cfg.removeProb and len(ind.obstacles) > 1:
         ind.obstacles.pop(rng.randrange(len(ind.obstacles)))
+    # Perturbed positions/sizes and the add step can introduce overlaps; clean
+    # them up here so nextGeneration's invalidLayout retry loop is rarely hit.
+    if len(ind.obstacles) > 1 and hasOverlap(ind.obstacles):
+        ind.obstacles = resolveOverlaps(cfg, ind.obstacles)
     return ind
 
 
