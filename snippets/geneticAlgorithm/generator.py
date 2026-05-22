@@ -342,12 +342,21 @@ def randomObstacle(
     return Obstacle(size, position)
 
 
+def obstacleCountSchedule(popSize: int, maxObstacles: int):
+    # Cycle 1..maxObstacles so each count appears at least popSize // maxObstacles
+    # times in the initial population. Counters random.randint bias that lets
+    # singleton layouts dominate when popSize is small.
+    return [1 + (k % maxObstacles) for k in range(popSize)]
+
+
 def randomIndividual(
     rng: random.Random,
     cfg: GAConfig,
     waypoints: Optional[List[Waypoint]] = None,
+    n: Optional[int] = None,
 ):
-    n = rng.randint(1, cfg.maxObstacles)
+    if n is None:
+        n = rng.randint(1, cfg.maxObstacles)
     obstacles: List[Obstacle] = []
     for _ in range(cfg.maxRetries):
         obstacles = [randomObstacle(rng, cfg, waypoints, idx) for idx in range(n)]
@@ -396,10 +405,12 @@ def seededIndividual(
     rng: random.Random,
     cfg: GAConfig,
     waypoints: List[Waypoint],
+    n: Optional[int] = None,
 ):
     # Uses corridorObstacle for placement; falls back to randomIndividual if
     # the corridor placement cannot pass the layout check after maxRetries.
-    n = rng.randint(1, cfg.maxObstacles)
+    if n is None:
+        n = rng.randint(1, cfg.maxObstacles)
     for _ in range(cfg.maxRetries):
         obstacles = [corridorObstacle(rng, cfg, waypoints, idx) for idx in range(n)]
         if not invalidLayout(cfg, obstacles):
@@ -408,7 +419,7 @@ def seededIndividual(
             obstacles = resolveOverlaps(cfg, obstacles)
             if not invalidLayout(cfg, obstacles):
                 return Individual(obstacles=obstacles)
-    return randomIndividual(rng, cfg, waypoints)
+    return randomIndividual(rng, cfg, waypoints, n)
 
 
 def crossover(rng: random.Random, a: Individual, b: Individual):
@@ -699,10 +710,12 @@ class GeneticGenerator:
         maxGoodDuration = 0.0
 
         useCorridorSeed = len(self.waypoints) >= 2
+        counts = obstacleCountSchedule(cfg.popSize, cfg.maxObstacles)
+        logger.info("initial obstacle counts: %s", counts)
         pop = [
-            seededIndividual(self.rng, cfg, self.waypoints) if useCorridorSeed
-            else randomIndividual(self.rng, cfg, self.waypoints)
-            for _ in range(cfg.popSize)
+            seededIndividual(self.rng, cfg, self.waypoints, n) if useCorridorSeed
+            else randomIndividual(self.rng, cfg, self.waypoints, n)
+            for n in counts
         ]
         evaluated: List[Individual] = []
         simsUsed = 0
