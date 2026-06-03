@@ -46,17 +46,16 @@ LATERAL_MAX_M = 10.0
 class GAConfig:
     seed: Optional[int] = None
 
-    popSize: int = 10
+    popSize: int = 20
     topK: int = 10
     maxObstacles: int = 3
     maxRetries: int = 20
-    maxGenerations: int = 200
     mutationRate: float = 0.2
     addProb: float = 0.15
     removeProb: float = 0.15
     sigmaFrac: float = 0.10
     tournamentK: int = 3
-    eliteSize: int = 1
+    eliteSize: int = 2
 
     xMin: float = -40.0
     xMax: float = 30.0
@@ -724,8 +723,9 @@ def nextGeneration(
     pop: List[Individual],
     waypoints: Optional[List[Waypoint]] = None,
 ):
-    elite = min(pop, key=lambda i: i.fitness)
-    children: List[Individual] = [elite]
+    eliteCount = min(cfg.eliteSize, len(pop))
+    elites = sorted(pop, key=lambda i: i.fitness)[:eliteCount]
+    children: List[Individual] = list(elites)
     while len(children) < cfg.popSize:
         child: Optional[Individual] = None
         for _ in range(cfg.maxRetries):
@@ -787,12 +787,25 @@ class GeneticGenerator:
         if budget <= 0:
             logger.error("budget must be > 0")
             return []
+
+        # Shrink population when budget is too small to fill the default pop.
+        # Below popSize sims the initial evaluation alone would exhaust the budget,
+        # so scale down to sqrt(budget) to leave room for at least a few generations.
+        if budget < cfg.popSize:
+            effectivePopSize = max(2, round(math.sqrt(budget)))
+            cfg = replace(cfg, popSize=effectivePopSize)
+
         # Reserve refinement budget only when phase 1 can still run one full population.
         phase1Budget = min(budget, max(cfg.popSize, int((1 - cfg.refineFraction) * budget)))
         phase2Budget = budget - phase1Budget
+
+        # Max generations: how many full populations fit inside the phase-1 budget
+        # (minus 1 for the initial population that is evaluated before evolution starts).
+        maxGen = max(1, phase1Budget // cfg.popSize - 1)
+
         logger.info(
-            "GA: budget=%s pop=%s phase1=%s phase2=%s",
-            budget, cfg.popSize, phase1Budget, phase2Budget,
+            "GA: budget=%s pop=%s maxGen=%s phase1=%s phase2=%s",
+            budget, cfg.popSize, maxGen, phase1Budget, phase2Budget,
         )
 
         # Goal == last mission waypoint; parseWaypoints falls back to [(0,0)]
@@ -811,7 +824,7 @@ class GeneticGenerator:
         evaluated: List[Individual] = []
         simsUsed = 0
         gen = 0
-        while simsUsed < phase1Budget and gen < cfg.maxGenerations:
+        while simsUsed < phase1Budget and gen < maxGen:
             for ind in pop:
                 if ind.valid:
                     continue
