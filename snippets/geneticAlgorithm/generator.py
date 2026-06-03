@@ -543,7 +543,13 @@ def mutate(
             Obstacle.Position(x=x, y=y, z=0, r=r),
         )
     if rng.random() < cfg.addProb and len(ind.obstacles) < cfg.maxObstacles:
-        ind.obstacles.append(randomObstacle(rng, cfg, waypoints, len(ind.obstacles)))
+        idx = len(ind.obstacles)
+        if waypoints is not None and len(waypoints) >= 2:
+            side = rng.choice([SIDE_LEFT, SIDE_RIGHT])
+            longitudinal = rng.choice([LONG_FRONT, LONG_REAR])
+            ind.obstacles.append(corridorObstacle(rng, cfg, waypoints, idx, side, longitudinal))
+        else:
+            ind.obstacles.append(randomObstacle(rng, cfg, waypoints, idx))
     if rng.random() < cfg.removeProb and len(ind.obstacles) > 1:
         ind.obstacles.pop(rng.randrange(len(ind.obstacles)))
     # Perturbed positions/sizes and the add step can introduce overlaps; clean
