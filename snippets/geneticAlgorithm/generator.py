@@ -320,8 +320,21 @@ def reachedGoal(trajectory, goalXY: Waypoint, tol: float):
     return math.hypot(last.x - goalXY[0], last.y - goalXY[1]) <= tol
 
 
+def pickSegment(rng: random.Random, waypoints: List[Waypoint]):
+    # Weight by segment length so short segments (e.g. home->takeoff ~0.5 m)
+    # are not sampled as often as the main flight leg (~50 m).
+    lengths = [
+        math.hypot(waypoints[i + 1][0] - waypoints[i][0], waypoints[i + 1][1] - waypoints[i][1])
+        for i in range(len(waypoints) - 1)
+    ]
+    total = sum(lengths)
+    if total < 1e-9:
+        return rng.randrange(len(waypoints) - 1)
+    return rng.choices(range(len(waypoints) - 1), weights=lengths, k=1)[0]
+
+
 def anchorOnPath(rng: random.Random, waypoints: List[Waypoint]):
-    i = rng.randrange(len(waypoints) - 1)
+    i = pickSegment(rng, waypoints)
     a, b = waypoints[i], waypoints[i + 1]
     t = rng.random()
     return (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
@@ -433,7 +446,7 @@ def corridorObstacle(
     # in the chosen half of a path segment (front = closer to destination,
     # rear = closer to origin), push it laterally onto the chosen side with a
     # uniform offset, then rotate to face the approach direction.
-    i = rng.randrange(len(waypoints) - 1)
+    i = pickSegment(rng, waypoints)
     a, b = waypoints[i], waypoints[i + 1]
     dx, dy = b[0] - a[0], b[1] - a[1]
     segLen = math.hypot(dx, dy)
