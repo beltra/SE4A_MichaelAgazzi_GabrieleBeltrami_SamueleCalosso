@@ -498,10 +498,20 @@ def seededIndividual(
 
 
 def crossover(rng: random.Random, a: Individual, b: Individual):
-    pool = a.obstacles + b.obstacles
+    # Positional crossover: for each slot index pick the obstacle from parent A
+    # or B at that position. This preserves structured arrangements (e.g. a
+    # left+right flanking pair) instead of shuffling the merged pool arbitrarily.
     n = rng.choice([len(a.obstacles), len(b.obstacles)])
-    chosen = rng.sample(pool, n)
-    return Individual(obstacles=[copy.deepcopy(o) for o in chosen])
+    result = []
+    for i in range(n):
+        if i < len(a.obstacles) and i < len(b.obstacles):
+            src = a if rng.random() < 0.5 else b
+        elif i < len(a.obstacles):
+            src = a
+        else:
+            src = b
+        result.append(copy.deepcopy(src.obstacles[i]))
+    return Individual(obstacles=result)
 
 
 def mutate(
