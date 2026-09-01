@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 # the last entry covers >= TIER_BOUNDS[-1] (5/2/1/0 for <0.25 / <1.0 / <1.5 / >=1.5).
 TIER_BOUNDS = (0.25, 1.0, 1.5)
 TIER_POINTS = (5, 2, 1, 0)
+OFFICIAL_EVALUATION_RUNS = 3
 
 # Side of the trajectory an obstacle sits on. With the trajectory unit vector
 # (ux, uy) the perpendicular (-uy, ux) is a 90deg CCW rotation, i.e. LEFT of
@@ -47,7 +48,8 @@ class GAConfig:
     seed: Optional[int] = None
 
     popSize: int = 20
-    topK: int = 10
+    # The competition evaluates the first 20 tests returned by a tool.
+    topK: int = 20
     maxObstacles: int = 3
     maxRetries: int = 20
     mutationRate: float = 0.2
@@ -69,22 +71,14 @@ class GAConfig:
     rMax: float = 90.0
     hFixed: float = 25.0
 
-    # Fitness weights (additive, all small relative to tier point gap).
-    meanWeight: float = 0.1
-    countWeight: float = 0.05
-    varianceWeight: float = 0.2
-    # Continuous pull toward lower distances; provides gradient in the tier-0
-    # zone (dist >= 1.5 m) where tierPoints is flat at 0.  Bounded in (-1, 0],
-    # so it cannot outweigh a genuine tier promotion.
-    continuousWeight: float = 1.0
-
     # Path-aware seeding.
     pathSigma: float = 8.0
 
     # Post-GA refinement.
     refineFraction: float = 0.10
     refineThreshold: float = 1.5
-    nReruns: int = 4
+    # One initial execution plus two reruns matches the three-run protocol.
+    nReruns: int = OFFICIAL_EVALUATION_RUNS - 1
     failSentinel: float = 5.0
 
     # Top-K obstacle-centroid diversity filter.
@@ -94,14 +88,9 @@ class GAConfig:
     # is farther than goalTol from the last mission waypoint. The watchdog
     # kills runs that exceed timeoutMul * (slowest reached-goal run so far),
     # with minTimeout as the floor before any good run has been observed.
-    # stuckBonus is subtracted from fitness on stuck candidates: an SUT that
-    # fails to complete the mission is itself a defect we want surfaced, so
-    # we make these competitive with a tier-2 obstacle hit without dominating
-    # a tier-5 one (the official scorer only rewards obstacle proximity).
     goalTol: float = 5.0
     timeoutMul: float = 2.5
     minTimeout: float = 300.0
-    stuckBonus: float = 2.0
 
 
 Waypoint = Tuple[float, float]
@@ -111,9 +100,11 @@ Waypoint = Tuple[float, float]
 class Individual:
     obstacles: List[Obstacle]
     fitness: float = float("inf")
+    officialScore: float = 0.0
     testCase: Optional[TestCase] = None
     valid: bool = False
     distances: List[float] = field(default_factory=list)
+    executionDurations: List[float] = field(default_factory=list)
     stuck: bool = False
     duration: float = 0.0
 
@@ -267,17 +258,43 @@ def tierPoints(d: float):
     return TIER_POINTS[-1]
 
 
-def fitnessFor(cfg: GAConfig, distances: List[float], obstacleCount: int, stuck: bool = False):
-    meanD = sum(distances) / len(distances)
-    stdD = statistics.stdev(distances) if len(distances) > 1 else 0.0
-    return (
-        -tierPoints(meanD)
-        - cfg.continuousWeight / (1.0 + meanD)
-        - (cfg.stuckBonus if stuck else 0.0)
-        + cfg.meanWeight * meanD
-        + cfg.countWeight * obstacleCount
-        + cfg.varianceWeight * stdD
+def officialTestScore(
+    distances: List[float],
+    obstacleCount: int,
+    executionDurations: List[float],
+):
+    """Return the official failure score for one test case."""
+    if not distances or not executionDurations:
+        return 0.0
+    if len(distances) != len(executionDurations):
+        raise ValueError("each distance must have a matching execution duration")
+    if obstacleCount <= 0:
+        raise ValueError("obstacleCount must be positive")
+    if any(duration <= 0.0 for duration in executionDurations):
+        raise ValueError("execution durations must be positive")
+
+    avgPoint = statistics.fmean(tierPoints(distance) for distance in distances)
+    avgTimeMinutes = statistics.fmean(executionDurations) / 60.0
+    return (avgPoint * 10.0) / ((obstacleCount ** 2) * avgTimeMinutes)
+
+
+def fitnessFor(
+    distances: List[float],
+    obstacleCount: int,
+    executionDurations: List[float],
+):
+    return -officialTestScore(distances, obstacleCount, executionDurations)
+
+
+def selectionKey(ind: Individual):
+    """Rank by score, then deterministic search tie-breakers."""
+    meanDistance = statistics.fmean(ind.distances) if ind.distances else float("inf")
+    meanDuration = (
+        statistics.fmean(ind.executionDurations)
+        if ind.executionDurations
+        else float("inf")
     )
+    return ind.fitness, len(ind.obstacles), meanDistance, meanDuration
 
 
 def wgs84ToLocal(lat: float, lon: float, homeLat: float, homeLon: float):
@@ -570,7 +587,7 @@ def mutate(
 
 def tournament(rng: random.Random, cfg: GAConfig, pop: List[Individual]):
     contenders = rng.sample(pop, min(cfg.tournamentK, len(pop)))
-    return min(contenders, key=lambda i: i.fitness)
+    return min(contenders, key=selectionKey)
 
 
 # Anything spawned by roslaunch inherits the pipe write end Aerialist polls on;
@@ -647,7 +664,9 @@ def evaluate(
     t0 = time.monotonic()
     try:
         tc = TestCase(caseStudy, ind.obstacles)
+        executionStarted = time.monotonic()
         tc.execute()
+        executionDuration = time.monotonic() - executionStarted
         distances = tc.get_distances()
         if not distances:
             raise RuntimeError("no distances")
@@ -657,10 +676,14 @@ def evaluate(
         tc.plot()
         ind.testCase = tc
         ind.distances.append(minDist)
+        ind.executionDurations.append(max(executionDuration, 1e-9))
         if goalXY is not None and not reachedGoal(tc.trajectory, goalXY, cfg.goalTol):
             ind.stuck = True
             logger.info("stuck: final trajectory point not within %.1fm of goal", cfg.goalTol)
-        ind.fitness = fitnessFor(cfg, ind.distances, len(ind.obstacles), ind.stuck)
+        ind.fitness = fitnessFor(
+            ind.distances, len(ind.obstacles), ind.executionDurations
+        )
+        ind.officialScore = -ind.fitness
         ind.valid = True
     except Exception as e:
         if killed[0]:
@@ -687,9 +710,13 @@ def rerun(
 ):
     timer, killed = armWatchdog(killAfter)
     t0 = time.monotonic()
+    executionStarted = t0
+    executionDuration = 0.0
     try:
         tc = TestCase(caseStudy, copy.deepcopy(ind.obstacles))
+        executionStarted = time.monotonic()
         tc.execute()
+        executionDuration = time.monotonic() - executionStarted
         distances = tc.get_distances()
         if not distances:
             raise RuntimeError("no distances")
@@ -702,15 +729,16 @@ def rerun(
             ind.stuck = True
             logger.info("stuck on rerun: final point not within %.1fm of goal", cfg.goalTol)
     except Exception as e:
+        executionDuration = time.monotonic() - executionStarted
         if killed[0]:
             ind.stuck = True
             logger.info("stuck on rerun: watchdog killed run after %.1fs", time.monotonic() - t0)
         else:
-            # A finite sentinel keeps mean/stdev defined, drops the run into the
-            # worthless tier, and inflates variance so flaky candidates rank worse.
+            # A finite sentinel records the official zero-point tier.
             logger.warning("rerun failed (penalised with sentinel %s): %s", cfg.failSentinel, e)
         ind.distances.append(cfg.failSentinel)
     finally:
+        ind.executionDurations.append(max(executionDuration, 1e-9))
         if timer is not None:
             timer.cancel()
         ind.duration = time.monotonic() - t0
@@ -724,7 +752,7 @@ def nextGeneration(
     waypoints: Optional[List[Waypoint]] = None,
 ):
     eliteCount = min(cfg.eliteSize, len(pop))
-    elites = sorted(pop, key=lambda i: i.fitness)[:eliteCount]
+    elites = sorted(pop, key=selectionKey)[:eliteCount]
     children: List[Individual] = list(elites)
     while len(children) < cfg.popSize:
         child: Optional[Individual] = None
@@ -840,8 +868,14 @@ class GeneticGenerator:
                     simsUsed += 1
                 if simsUsed >= phase1Budget:
                     break
-            bestFitness = min(i.fitness for i in pop)
-            logger.info("[gen %d] best=%.2f sims=%d/%d", gen, bestFitness, simsUsed, phase1Budget)
+            best = min(pop, key=selectionKey)
+            logger.info(
+                "[gen %d] best official score=%.4f sims=%d/%d",
+                gen,
+                best.officialScore,
+                simsUsed,
+                phase1Budget,
+            )
             if simsUsed >= phase1Budget:
                 break
             pop = nextGeneration(self.rng, cfg, pop, self.waypoints)
@@ -850,7 +884,7 @@ class GeneticGenerator:
         # Phase 2: rerun promising single-shot candidates to filter flaky near-misses.
         promising = sorted(
             [i for i in evaluated if i.distances and i.distances[0] < cfg.refineThreshold],
-            key=lambda i: i.fitness,
+            key=selectionKey,
         )
         simsLeft = phase2Budget
         for cand in promising:
@@ -863,14 +897,21 @@ class GeneticGenerator:
                 simsLeft -= 1
                 if simsLeft <= 0:
                     break
-            cand.fitness = fitnessFor(cfg, cand.distances, len(cand.obstacles), cand.stuck)
+            cand.fitness = fitnessFor(
+                cand.distances,
+                len(cand.obstacles),
+                cand.executionDurations,
+            )
+            cand.officialScore = -cand.fitness
             meanD = sum(cand.distances) / len(cand.distances)
             logger.info(
-                "refined: runs=%d mean=%.2f fitness=%.2f",
-                len(cand.distances), meanD, cand.fitness,
+                "refined: runs=%d mean-distance=%.2f official-score=%.4f",
+                len(cand.distances),
+                meanD,
+                cand.officialScore,
             )
 
-        evaluated.sort(key=lambda i: i.fitness)
+        evaluated.sort(key=selectionKey)
         selected: List[Individual] = []
         for cand in evaluated:
             if len(selected) >= cfg.topK:
