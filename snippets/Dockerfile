@@ -1,6 +1,12 @@
 FROM skhatiri/aerialist:latest
-RUN apt-get update && apt-get install -y --no-install-recommends xvfb && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends docker.io xvfb && rm -rf /var/lib/apt/lists/*
 RUN pip3 install -e /src/aerialist/ lz4
+
+# Simulator workers are started from this image, so bake the same idempotent
+# Aerialist fixes into the image instead of only patching the coordinator at
+# container startup.
+COPY patchAerialist.py /tmp/patchAerialist.py
+RUN python3 /tmp/patchAerialist.py && rm /tmp/patchAerialist.py
 
 RUN wget https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz && \
     tar -xzf patchelf-0.18.0-x86_64.tar.gz && \

@@ -7,9 +7,15 @@ services:
       - ../snippets:/src/generator/
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - /var/run/docker.sock:/var/run/docker.sock
-      - $HOME/.Xauthority:/tmp/.Xauthority:rw
+      - $HOME/.docker-xauth:/tmp/.Xauthority:rw
       - ./sysroot:/opt/sysroot:ro
     environment:
+      - AGENT=docker
+      - DOCKER_IMG=docker-uav-testing
+      - DOCKER_TIMEOUT=300
+      - GA_WORKERS=4
+      - SIM_WORKER_GPU=true
+      - SIM_WORKER_SPEED=8
       - DISPLAY=${DISPLAY}
       - XAUTHORITY=/tmp/.Xauthority
       - QT_X11_NO_MITSHM=1

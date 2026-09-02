@@ -10,6 +10,12 @@ services:
       - $HOME/.Xauthority:/tmp/.Xauthority:rw
       - ./sysroot:/opt/sysroot:ro
     environment:
+      - AGENT=docker
+      - DOCKER_IMG=docker-uav-testing
+      - DOCKER_TIMEOUT=300
+      - GA_WORKERS=2
+      - SIM_WORKER_GPU=false
+      - SIM_WORKER_SPEED=3
       - DISPLAY=${DISPLAY}
       - XAUTHORITY=/tmp/.Xauthority
       - VSCODE_SERVER_CUSTOM_GLIBC_LINKER=/opt/sysroot/lib/ld-linux-x86-64.so.2

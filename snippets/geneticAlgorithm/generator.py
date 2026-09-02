@@ -11,12 +11,13 @@ import statistics
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import List, Optional, Tuple
 
 from aerialist.px4.aerialist_test import AerialistTest
 from aerialist.px4.obstacle import Obstacle
-from testcase import TestCase
+from testcase import TestCase, is_isolated_execution
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,9 @@ class GAConfig:
     sigmaFrac: float = 0.10
     tournamentK: int = 3
     eliteSize: int = 2
+    parallelWorkers: int = field(
+        default_factory=lambda: max(1, int(os.environ.get("GA_WORKERS", "1")))
+    )
 
     xMin: float = -40.0
     xMax: float = 30.0
@@ -699,7 +703,8 @@ def evaluate(
         ind.fitness = float("inf")
         ind.valid = False
         return False
-    timer, killed = armWatchdog(killAfter)
+    isolated = is_isolated_execution()
+    timer, killed = (None, [False]) if isolated else armWatchdog(killAfter)
     t0 = time.monotonic()
     try:
         tc = TestCase(caseStudy, ind.obstacles)
@@ -736,7 +741,8 @@ def evaluate(
         if timer is not None:
             timer.cancel()
         ind.duration = time.monotonic() - t0
-        cleanupSimState()
+        if not isolated:
+            cleanupSimState()
     return True
 
 
@@ -747,7 +753,8 @@ def rerun(
     goalXY: Optional[Waypoint] = None,
     killAfter: float = 0.0,
 ):
-    timer, killed = armWatchdog(killAfter)
+    isolated = is_isolated_execution()
+    timer, killed = (None, [False]) if isolated else armWatchdog(killAfter)
     t0 = time.monotonic()
     executionStarted = t0
     executionDuration = 0.0
@@ -781,7 +788,41 @@ def rerun(
         if timer is not None:
             timer.cancel()
         ind.duration = time.monotonic() - t0
-        cleanupSimState()
+        if not isolated:
+            cleanupSimState()
+
+
+def runParallelBatch(cfg: GAConfig, jobs, operation, label: str):
+    """Run independent simulator jobs and report aggregate throughput."""
+    if not jobs:
+        return []
+
+    def timedOperation(job):
+        started = time.monotonic()
+        result = operation(*job)
+        return result, time.monotonic() - started
+
+    workers = min(cfg.parallelWorkers, len(jobs))
+    started = time.monotonic()
+    if workers == 1:
+        completed = [timedOperation(job) for job in jobs]
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ga-sim") as pool:
+            futures = [pool.submit(timedOperation, job) for job in jobs]
+            completed = [future.result() for future in futures]
+    wall = time.monotonic() - started
+    results = [result for result, _ in completed]
+    simulatorWork = sum(duration for _, duration in completed)
+    logger.info(
+        "%s batch: workers=%d jobs=%d wall=%.1fs simulator-work=%.1fs throughput=%.2fx",
+        label,
+        workers,
+        len(jobs),
+        wall,
+        simulatorWork,
+        simulatorWork / wall if wall > 0 else 0.0,
+    )
+    return results
 
 
 def nextGeneration(
@@ -854,6 +895,11 @@ class GeneticGenerator:
         if budget <= 0:
             logger.error("budget must be > 0")
             return []
+        if cfg.parallelWorkers > 1 and not is_isolated_execution():
+            logger.warning(
+                "parallel workers require an isolated docker/k8s agent; using one local worker"
+            )
+            cfg = replace(cfg, parallelWorkers=1)
 
         # Shrink population when budget is too small to fill the default pop.
         # Below popSize sims the initial evaluation alone would exhaust the budget,
@@ -871,8 +917,13 @@ class GeneticGenerator:
         maxGen = max(1, phase1Budget // cfg.popSize - 1)
 
         logger.info(
-            "GA: budget=%s pop=%s maxGen=%s phase1=%s phase2=%s",
-            budget, cfg.popSize, maxGen, phase1Budget, phase2Budget,
+            "GA: budget=%s pop=%s workers=%s maxGen=%s phase1=%s phase2=%s",
+            budget,
+            cfg.popSize,
+            cfg.parallelWorkers,
+            maxGen,
+            phase1Budget,
+            phase2Budget,
         )
 
         # Goal == last mission waypoint; parseWaypoints falls back to [(0,0)]
@@ -892,11 +943,12 @@ class GeneticGenerator:
         simsUsed = 0
         gen = 0
         while simsUsed < phase1Budget and gen < maxGen:
-            for ind in pop:
-                if ind.valid:
-                    continue
-                killAfter = max(cfg.minTimeout, cfg.timeoutMul * maxGoodDuration)
-                consumed = evaluate(cfg, ind, self.caseStudy, goalXY, killAfter)
+            remaining = phase1Budget - simsUsed
+            candidates = [ind for ind in pop if not ind.valid][:remaining]
+            killAfter = max(cfg.minTimeout, cfg.timeoutMul * maxGoodDuration)
+            jobs = [(cfg, ind, self.caseStudy, goalXY, killAfter) for ind in candidates]
+            consumedResults = runParallelBatch(cfg, jobs, evaluate, f"generation {gen}")
+            for ind, consumed in zip(candidates, consumedResults):
                 if ind.valid:
                     evaluated.append(ind)
                     # Only reached-goal runs feed the threshold; otherwise a slow
@@ -905,8 +957,6 @@ class GeneticGenerator:
                         maxGoodDuration = ind.duration
                 if consumed:
                     simsUsed += 1
-                if simsUsed >= phase1Budget:
-                    break
             best = min(pop, key=selectionKey)
             logger.info(
                 "[gen %d] best official score=%.4f sims=%d/%d",
@@ -926,29 +976,31 @@ class GeneticGenerator:
             key=selectionKey,
         )
         simsLeft = phase2Budget
+        rerunJobs = []
         for cand in promising:
             if simsLeft <= 0:
                 break
             nMore = min(cfg.nReruns, simsLeft)
             killAfter = max(cfg.minTimeout, cfg.timeoutMul * maxGoodDuration)
             for _ in range(nMore):
-                rerun(cfg, cand, self.caseStudy, goalXY, killAfter)
+                rerunJobs.append((cfg, cand, self.caseStudy, goalXY, killAfter))
                 simsLeft -= 1
-                if simsLeft <= 0:
-                    break
-            cand.fitness = fitnessFor(
-                cand.distances,
-                len(cand.obstacles),
-                cand.executionDurations,
-            )
-            cand.officialScore = -cand.fitness
-            meanD = sum(cand.distances) / len(cand.distances)
-            logger.info(
-                "refined: runs=%d mean-distance=%.2f official-score=%.4f",
-                len(cand.distances),
-                meanD,
-                cand.officialScore,
-            )
+        runParallelBatch(cfg, rerunJobs, rerun, "refinement")
+        for cand in promising:
+            if len(cand.distances) > 1:
+                cand.fitness = fitnessFor(
+                    cand.distances,
+                    len(cand.obstacles),
+                    cand.executionDurations,
+                )
+                cand.officialScore = -cand.fitness
+                meanD = sum(cand.distances) / len(cand.distances)
+                logger.info(
+                    "refined: runs=%d mean-distance=%.2f official-score=%.4f",
+                    len(cand.distances),
+                    meanD,
+                    cand.officialScore,
+                )
 
         evaluated.sort(key=selectionKey)
         selected: List[Individual] = []
