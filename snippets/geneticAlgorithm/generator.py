@@ -42,6 +42,16 @@ LONG_REAR = "R"
 # Uniform lateral offset bound (metres) used when placing corridor obstacles.
 LATERAL_MAX_M = 10.0
 
+# Thin-wall parameters used by trapObstacles.
+WALL_LENGTH_M = (15.0, 20.0)
+WALL_THICKNESS_M = (2.0, 3.0)
+WALL_JITTER_DEG = 3.0
+DIAG_CROSSING_DEG = 42.0
+DIAG_OFFSET_M = (1.0, 2.0)
+DIAG_SIDE = 1.0
+BLOCKER_GAP_M = (10.0, 13.0)
+BLOCKER_OFFSET_M = (2.0, 6.0)
+
 
 @dataclass
 class GAConfig:
@@ -383,11 +393,10 @@ def randomObstacle(
     return Obstacle(size, position)
 
 
-def obstacleCountSchedule(popSize: int, maxObstacles: int):
-    # Cycle 1..maxObstacles so each count appears at least popSize // maxObstacles
-    # times in the initial population. Counters random.randint bias that lets
-    # singleton layouts dominate when popSize is small.
-    return [1 + (k % maxObstacles) for k in range(popSize)]
+def obstacleCountSchedule(popSize: int):
+    # The score divides by obstacles^2, so favor single-obstacle layouts while
+    # still seeding pairs that can form a trap.
+    return [[1, 1, 2][k % 3] for k in range(popSize)]
 
 
 def randomIndividual(
@@ -450,40 +459,67 @@ def longitudinalSchedule(rng: random.Random, n: int):
     return []
 
 
-def corridorObstacle(
+def thinWall(
     rng: random.Random,
     cfg: GAConfig,
     waypoints: List[Waypoint],
-    idx: int = 0,
-    side: str = SIDE_LEFT,
-    longitudinal: str = LONG_FRONT,
+    i: int,
+    t: float,
+    lateral: float,
+    crossingDeg: float,
 ):
-    # Place an obstacle alongside the drone's path: centre on a random point
-    # in the chosen half of a path segment (front = closer to destination,
-    # rear = closer to origin), push it laterally onto the chosen side with a
-    # uniform offset, then rotate to face the approach direction.
-    i = pickSegment(rng, waypoints)
     a, b = waypoints[i], waypoints[i + 1]
     dx, dy = b[0] - a[0], b[1] - a[1]
     segLen = math.hypot(dx, dy)
     if segLen < 1e-6:
         return randomObstacle(rng, cfg, waypoints)
-    ux, uy = dx / segLen, dy / segLen   # unit vector along segment
-    px, py = -uy, ux                    # +perpendicular = LEFT of forward direction
+    x = clamp(a[0] + t * dx - lateral * dy / segLen, cfg.xMin, cfg.xMax)
+    y = clamp(a[1] + t * dy + lateral * dx / segLen, cfg.yMin, cfg.yMax)
+    jitter = rng.uniform(-WALL_JITTER_DEG, WALL_JITTER_DEG)
+    r = (math.degrees(math.atan2(dy, dx)) - crossingDeg + jitter) % 180.0
+    l, w = rng.uniform(*WALL_LENGTH_M), rng.uniform(*WALL_THICKNESS_M)
+    if r > 90.0:
+        # Swapping length and width represents the same box rotated by 90 degrees.
+        r, l, w = r - 90.0, w, l
+    return Obstacle(
+        Obstacle.Size(l=l, w=w, h=cfg.hFixed),
+        Obstacle.Position(x=x, y=y, z=0, r=r),
+    )
+
+
+def trapObstacles(rng: random.Random, cfg: GAConfig, waypoints: List[Waypoint], n: int):
+    i = pickSegment(rng, waypoints)
+    segLen = max(math.dist(waypoints[i], waypoints[i + 1]), 1e-6)
+    t = rng.uniform(0.35, 0.5)
+    side = DIAG_SIDE
+    offset = side * rng.uniform(*DIAG_OFFSET_M)
+    walls = [thinWall(rng, cfg, waypoints, i, t, offset, side * DIAG_CROSSING_DEG)]
+    if n >= 2:
+        t += rng.uniform(*BLOCKER_GAP_M) / segLen
+        offset = -side * rng.uniform(*BLOCKER_OFFSET_M)
+        walls.append(thinWall(rng, cfg, waypoints, i, t, offset, 90.0))
+    return walls
+
+
+def corridorObstacle(
+    rng: random.Random,
+    cfg: GAConfig,
+    waypoints: List[Waypoint],
+    side: str = SIDE_LEFT,
+    longitudinal: str = LONG_FRONT,
+):
+    i = pickSegment(rng, waypoints)
     t = rng.uniform(0.5, 1.0) if longitudinal == LONG_FRONT else rng.uniform(0.0, 0.5)
-    cx = a[0] + t * dx
-    cy = a[1] + t * dy
     sign = 1.0 if side == SIDE_LEFT else -1.0
-    lateralOffset = sign * rng.uniform(0.0, LATERAL_MAX_M)
-    x = clamp(cx + lateralOffset * px, cfg.xMin, cfg.xMax)
-    y = clamp(cy + lateralOffset * py, cfg.yMin, cfg.yMax)
-    # Rotate so the obstacle face is perpendicular to the approach direction;
-    # mod 90 keeps r within [0, 90) regardless of segment orientation.
-    r = clamp(math.degrees(math.atan2(dy, dx)) % 90.0, cfg.rMin, cfg.rMax)
-    lLo, lHi = sizeTierBounds(cfg.lMin, cfg.lMax, idx)
-    wLo, wHi = sizeTierBounds(cfg.wMin, cfg.wMax, idx)
-    size = Obstacle.Size(l=rng.uniform(lLo, lHi), w=rng.uniform(wLo, wHi), h=cfg.hFixed)
-    return Obstacle(size, Obstacle.Position(x=x, y=y, z=0, r=r))
+    return thinWall(
+        rng,
+        cfg,
+        waypoints,
+        i,
+        t,
+        sign * rng.uniform(0.0, LATERAL_MAX_M),
+        90.0,
+    )
 
 
 def seededIndividual(
@@ -492,17 +528,20 @@ def seededIndividual(
     waypoints: List[Waypoint],
     n: Optional[int] = None,
 ):
-    # Uses corridorObstacle for placement; falls back to randomIndividual if
-    # the corridor placement cannot pass the layout check after maxRetries.
+    # Use validated trap layouts for one or two obstacles. Three-obstacle
+    # layouts retain the side and longitudinal schedules.
     if n is None:
         n = rng.randint(1, cfg.maxObstacles)
     sides = sideSchedule(rng, n)
     longs = longitudinalSchedule(rng, n)
     for _ in range(cfg.maxRetries):
-        obstacles = [
-            corridorObstacle(rng, cfg, waypoints, idx, sides[idx], longs[idx])
-            for idx in range(n)
-        ]
+        if n <= 2:
+            obstacles = trapObstacles(rng, cfg, waypoints, n)
+        else:
+            obstacles = [
+                corridorObstacle(rng, cfg, waypoints, sides[idx], longs[idx])
+                for idx in range(n)
+            ]
         if not invalidLayout(cfg, obstacles):
             return Individual(obstacles=obstacles)
         if n > 1:
@@ -568,14 +607,14 @@ def mutate(
             Obstacle.Size(l=l, w=w, h=cfg.hFixed),
             Obstacle.Position(x=x, y=y, z=0, r=r),
         )
-    if rng.random() < cfg.addProb and len(ind.obstacles) < cfg.maxObstacles:
-        idx = len(ind.obstacles)
+    addProb = cfg.addProb if len(ind.obstacles) < 2 else cfg.addProb / 10.0
+    if rng.random() < addProb and len(ind.obstacles) < cfg.maxObstacles:
         if waypoints is not None and len(waypoints) >= 2:
             side = rng.choice([SIDE_LEFT, SIDE_RIGHT])
             longitudinal = rng.choice([LONG_FRONT, LONG_REAR])
-            ind.obstacles.append(corridorObstacle(rng, cfg, waypoints, idx, side, longitudinal))
+            ind.obstacles.append(corridorObstacle(rng, cfg, waypoints, side, longitudinal))
         else:
-            ind.obstacles.append(randomObstacle(rng, cfg, waypoints, idx))
+            ind.obstacles.append(randomObstacle(rng, cfg, waypoints, len(ind.obstacles)))
     if rng.random() < cfg.removeProb and len(ind.obstacles) > 1:
         ind.obstacles.pop(rng.randrange(len(ind.obstacles)))
     # Perturbed positions/sizes and the add step can introduce overlaps; clean
@@ -842,7 +881,7 @@ class GeneticGenerator:
         maxGoodDuration = 0.0
 
         useCorridorSeed = len(self.waypoints) >= 2
-        counts = obstacleCountSchedule(cfg.popSize, cfg.maxObstacles)
+        counts = obstacleCountSchedule(cfg.popSize)
         logger.info("initial obstacle counts: %s", counts)
         pop = [
             seededIndividual(self.rng, cfg, self.waypoints, n) if useCorridorSeed
