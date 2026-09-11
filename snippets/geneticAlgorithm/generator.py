@@ -1,8 +1,14 @@
-"""Minimalist single-file genetic algorithm for PX4 Aerialist obstacle tests."""
+"""Genetic algorithm for PX4 Aerialist obstacle tests.
+
+Individuals carry path-relative genes (`genes.py`) that decode to one thin
+wall or one chevron gate across a flight segment (`motifs.py`). The loop here
+evaluates them on the simulator, breeds the next generation inside two
+protected niches (one and two obstacles), reruns the promising ones and
+hands the final choice to `suite.py`.
+"""
 
 import copy
 import glob
-import json
 import logging
 import math
 import os
@@ -13,11 +19,17 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from typing import List, Optional, Tuple
+from enum import IntEnum
+from typing import List, Optional
 
 from aerialist.px4.aerialist_test import AerialistTest
 from aerialist.px4.obstacle import Obstacle
 from testcase import TestCase, is_isolated_execution
+
+from geneticAlgorithm.genes import KIND_BY_COUNT, Genes, crossoverGenes, mutateGenes, randomGenes
+from geneticAlgorithm.mission import Segment, Waypoint, allSegments, longSegments, parseWaypoints
+from geneticAlgorithm.motifs import decode, layoutProblem
+from geneticAlgorithm.suite import calibrateThreshold, officialRank, selectSuite, suiteDiversity
 
 logger = logging.getLogger(__name__)
 
@@ -28,318 +40,267 @@ TIER_BOUNDS = (0.25, 1.0, 1.5)
 TIER_POINTS = (5, 2, 1, 0)
 OFFICIAL_EVALUATION_RUNS = 3
 
-# Side of the trajectory an obstacle sits on. With the trajectory unit vector
-# (ux, uy) the perpendicular (-uy, ux) is a 90deg CCW rotation, i.e. LEFT of
-# the drone's forward direction; the opposite perpendicular is RIGHT.
-SIDE_LEFT = "L"
-SIDE_RIGHT = "R"
-
-# Longitudinal half of the segment an obstacle sits on. F (front) places the
-# obstacle closer to the segment destination (drone's forward direction);
-# R (rear) places it closer to the origin.
-LONG_FRONT = "F"
-LONG_REAR = "R"
-
-# Uniform lateral offset bound (metres) used when placing corridor obstacles.
-LATERAL_MAX_M = 10.0
-
-# Thin-wall parameters used by trapObstacles.
-WALL_LENGTH_M = (15.0, 20.0)
-WALL_THICKNESS_M = (2.0, 3.0)
-WALL_JITTER_DEG = 3.0
-DIAG_CROSSING_DEG = 42.0
-DIAG_OFFSET_M = (1.0, 2.0)
-DIAG_SIDE = 1.0
-BLOCKER_GAP_M = (10.0, 13.0)
-BLOCKER_OFFSET_M = (2.0, 6.0)
-
 
 @dataclass
 class GAConfig:
+    """All tunable parameters of the genetic algorithm."""
     seed: Optional[int] = None
 
     popSize: int = 20
-    # The competition evaluates the first 20 tests returned by a tool.
-    topK: int = 20
-    maxObstacles: int = 3
+    topK: int = 20  # Number of tests returned for the submission.
+    # Draws allowed before a child is given up on.
     maxRetries: int = 20
-    mutationRate: float = 0.2
-    addProb: float = 0.15
-    removeProb: float = 0.15
-    sigmaFrac: float = 0.10
+    # Draws allowed for a fresh seed. Decoding is free, and on mission 4 the
+    # segments leave the placement area for most of their length, so only a few
+    # percent of gate draws fit and on mission 6 about one; 500 draws make a miss rare.
+    seedDraws: int = 500
     tournamentK: int = 3
-    eliteSize: int = 2
+    # Elites are carried over per niche (obstacle count), not globally, so the
+    # best pair survives even when every single scores higher than it.
+    elitePerNiche: int = 1
+    # Share of every generation that are gates (two obstacles): 6 of 20.
+    gateShare: float = 0.3
+    # Sides a seed may put the short end of its wall on: +1 is the side
+    # sideNormal points to (the drone's left), -1 the other. Both are drawn.
+    # A side = -1 wall has never scored (0 of 188 across the 21 speed-1
+    # campaigns), so (1,) is measurably better on mission 3, but it is not
+    # the default: the protocol asks for a second mission and mission 7 did
+    # not reproduce the gain. Every confirmed suite score was measured here.
+    seedSides: tuple = (-1, 1)
+    # Mutation step scale of the first generation of children and its decay
+    # per generation; 1.0 / 1.0 keeps the measured GENE_SIGMAS throughout.
+    mutationScale: float = 1.0
+    mutationDecay: float = 1.0
+    # Share of every generation's non-elite slots filled with fresh seeds
+    # instead of children. Selection concentrates the population on one
+    # segment and side within two generations; immigrants keep other frames
+    # in play, which is where a distinct trajectory has to come from.
+    immigrantShare: float = 0.0
+    # Give each niche's elite one more run at the start of every generation
+    # and rank it on the mean. An elite is chosen on a single run, and a
+    # layout's two runs disagree by 0.48 m on average, so an elite picked on
+    # a lucky run otherwise breeds for the rest of the campaign.
+    rerunElites: bool = False
+    # False: every generation is fresh seeds (the seed-only arm of the A/B
+    # measurement, GA_EVOLVE=0); selection and reruns stay the same.
+    evolve: bool = True
+    # Suite rules (suite.py): relax the similarity threshold to fill the
+    # suite; at most maxPerFrame tests per (segment, side), 0 for no quota;
+    # keep the best gate even when singles outscore it.
+    relaxSimilarity: bool = True
+    maxPerFrame: int = 0
+    keepBestGate: bool = False
+    # Continuous search-fitness shaping: shapeGain must stay below the
+    # smallest tier gap (1 point) so a shaped score can never search-outrank
+    # a genuinely better tier, only break ties within one. incompleteFactor
+    # discourages breeding from stuck runs, which the suite excludes anyway.
+    shapeGain: float = 0.25
+    incompleteFactor: float = 0.25
     parallelWorkers: int = field(
         default_factory=lambda: max(1, int(os.environ.get("GA_WORKERS", "1")))
     )
 
+    # Placement area, the same for every case study of the competition.
     xMin: float = -40.0
     xMax: float = 30.0
     yMin: float = 10.0
     yMax: float = 40.0
-    lMin: float = 2.0
-    lMax: float = 20.0
-    wMin: float = 2.0
-    wMax: float = 20.0
-    rMin: float = 0.0
-    rMax: float = 90.0
-    hFixed: float = 25.0
-
-    # Path-aware seeding.
-    pathSigma: float = 8.0
 
     # Post-GA refinement.
     refineFraction: float = 0.10
     refineThreshold: float = 1.5
-    # One initial execution plus two reruns matches the three-run protocol.
+    # The official score averages three executions, and the first one is the
+    # initial evaluation, so only the remaining two are reruns.
     nReruns: int = OFFICIAL_EVALUATION_RUNS - 1
     failSentinel: float = 5.0
-
-    # Top-K obstacle-centroid diversity filter.
-    diversityMinM: float = 10.0
 
     # Stuck-avoidance detection: drone is "stuck" if its final trajectory point
     # is farther than goalTol from the last mission waypoint. The watchdog
     # kills runs that exceed timeoutMul * (slowest reached-goal run so far),
     # with minTimeout as the floor before any good run has been observed.
     goalTol: float = 5.0
+    # A run that misses the goal without ever coming this close to an obstacle
+    # is treated as a simulator flake, not as a scored measurement.
+    flakeObstacleDistanceM: float = 5.0
+    maxFlakeRetries: int = 2
     timeoutMul: float = 2.5
     minTimeout: float = 300.0
 
 
-Waypoint = Tuple[float, float]
-
-
-@dataclass
+@dataclass(eq=False)
 class Individual:
+    """One candidate layout plus the results of its simulator runs."""
+
+    # eq=False: individuals are compared by identity, never by their fields.
+
     obstacles: List[Obstacle]
+    # The path-relative description the obstacles were decoded from; None
+    # only for layouts loaded from a YAML by the experiment scripts.
+    genes: Optional[Genes] = None
     fitness: float = float("inf")
     officialScore: float = 0.0
     testCase: Optional[TestCase] = None
     valid: bool = False
     distances: List[float] = field(default_factory=list)
-    executionDurations: List[float] = field(default_factory=list)
+    # Simulated flight seconds per run (from the trajectory), not wall-clock:
+    # feeds officialScore and fitness. `duration` below is wall-clock and
+    # feeds only the watchdog.
+    flightDurations: List[float] = field(default_factory=list)
+    # One trajectory per run, for the suite's similarity check.
+    trajectories: List = field(default_factory=list)
     stuck: bool = False
+    # No legal layout could be drawn for this slot: it costs no run and must
+    # not hold up the generation, or a niche with nothing legal (side +1
+    # gates on mission 6) would freeze the search.
+    illegal: bool = False
     duration: float = 0.0
+    # Discovery generation the layout was evaluated in (0 for the seeds).
+    generation: int = 0
 
 
-def clamp(v: float, lo: float, hi: float):
-    return max(lo, min(hi, v))
+class AttemptOutcome(IntEnum):
+    """Result of one simulator attempt; nonzero outcomes consumed budget."""
+
+    SKIPPED = 0
+    CONSUMED = 1
+    FLAKE = 2
 
 
-def gaussianPerturb(rng: random.Random, v: float, lo: float, hi: float, sigmaFrac: float):
-    sigma = sigmaFrac * (hi - lo)
-    return clamp(v + rng.gauss(0.0, sigma), lo, hi)
-
-
-def rotatedHalfExtents(l: float, w: float, rDeg: float):
-    cosR = abs(math.cos(math.radians(rDeg)))
-    sinR = abs(math.sin(math.radians(rDeg)))
-    return (
-        0.5 * (l * cosR + w * sinR),
-        0.5 * (l * sinR + w * cosR),
-    )
-
-
-def hasOverlap(obstacles: List[Obstacle]):
-    for i in range(len(obstacles)):
-        a = obstacles[i]
-        hxA, hyA = rotatedHalfExtents(a.size.l, a.size.w, a.position.r)
-        for j in range(i + 1, len(obstacles)):
-            b = obstacles[j]
-            hxB, hyB = rotatedHalfExtents(b.size.l, b.size.w, b.position.r)
-            dx = abs(a.position.x - b.position.x)
-            dy = abs(a.position.y - b.position.y)
-            if (hxA + hxB) >= dx and (hyA + hyB) >= dy:
-                return True
-    return False
-
-
-def fitsInBounds(cfg: GAConfig, obstacles: List[Obstacle]):
-    # Wiki says obstacles must fit in the case-study rectangle; clamping only
-    # the centre lets a rotated 20m box at y=10 reach down to y~1, i.e. right
-    # on the takeoff point, which traps the avoidance planner.
-    for o in obstacles:
-        hx, hy = rotatedHalfExtents(o.size.l, o.size.w, o.position.r)
-        if (
-            o.position.x - hx < cfg.xMin
-            or o.position.x + hx > cfg.xMax
-            or o.position.y - hy < cfg.yMin
-            or o.position.y + hy > cfg.yMax
-        ):
-            return False
-    return True
+def placementBounds(cfg: GAConfig):
+    """Return the placement area as (xMin, xMax, yMin, yMax)."""
+    return cfg.xMin, cfg.xMax, cfg.yMin, cfg.yMax
 
 
 def invalidLayout(cfg: GAConfig, obstacles: List[Obstacle]):
-    return hasOverlap(obstacles) or not fitsInBounds(cfg, obstacles)
-
-
-def shiftObstacle(o: Obstacle, dx: float, dy: float):
-    return Obstacle(
-        Obstacle.Size(l=o.size.l, w=o.size.w, h=o.size.h),
-        Obstacle.Position(
-            x=o.position.x + dx, y=o.position.y + dy,
-            z=o.position.z, r=o.position.r,
-        ),
-    )
-
-
-def shrinkObstacle(cfg: GAConfig, o: Obstacle):
-    # Halve the footprint, clamped to lMin/wMin so the obstacle stays valid
-    # geometry even after several shrink steps.
-    return Obstacle(
-        Obstacle.Size(
-            l=max(cfg.lMin, o.size.l * 0.5),
-            w=max(cfg.wMin, o.size.w * 0.5),
-            h=o.size.h,
-        ),
-        o.position,
-    )
-
-
-def mtv(a: Obstacle, b: Obstacle):
-    # Minimum translation vector along the centre-to-centre line, computed on
-    # the rotated AABBs. Returns (dx, dy) pointing from a to b with length
-    # equal to the penetration; (0, 0) when the AABBs do not overlap.
-    hxA, hyA = rotatedHalfExtents(a.size.l, a.size.w, a.position.r)
-    hxB, hyB = rotatedHalfExtents(b.size.l, b.size.w, b.position.r)
-    cx = b.position.x - a.position.x
-    cy = b.position.y - a.position.y
-    dist = math.hypot(cx, cy)
-    if dist < 1e-9:
-        # Coincident centres: pick +x as a stable separation direction.
-        ux, uy = 1.0, 0.0
-        dist = 0.0
-    else:
-        ux, uy = cx / dist, cy / dist
-    needed = (hxA + hxB) * abs(ux) + (hyA + hyB) * abs(uy)
-    penetration = needed - dist
-    if penetration <= 0.0:
-        return 0.0, 0.0
-    return ux * penetration, uy * penetration
-
-
-def findOverlapPair(obstacles: List[Obstacle]):
-    for i in range(len(obstacles)):
-        for j in range(i + 1, len(obstacles)):
-            dx, dy = mtv(obstacles[i], obstacles[j])
-            if dx != 0.0 or dy != 0.0:
-                return i, j
-    return None
-
-
-def separatePair(cfg: GAConfig, a: Obstacle, b: Obstacle, delta: float = 1.0):
-    # Push a and b apart along the centre-to-centre line by MTV/2 each, plus
-    # delta/2 each of slack so the final gap is "penetration + delta" past
-    # touching. Returns None when either obstacle would leave the play area.
-    dx, dy = mtv(a, b)
-    if dx == 0.0 and dy == 0.0:
-        return a, b
-    pen = math.hypot(dx, dy)
-    ux, uy = dx / pen, dy / pen
-    half = (pen + delta) * 0.5
-    newA = shiftObstacle(a, -ux * half, -uy * half)
-    newB = shiftObstacle(b, ux * half, uy * half)
-    if not fitsInBounds(cfg, [newA, newB]):
-        return None
-    return newA, newB
-
-
-def resolveOverlaps(cfg: GAConfig, obstacles: List[Obstacle], maxIter: int = 6):
-    # Move overlapping pairs apart with separatePair; if a move would push an
-    # obstacle out of bounds, shrink both obstacles (l, w *= 0.5) and try again.
-    # Capped by maxIter to guarantee termination at min footprint.
-    obs = list(obstacles)
-    for _ in range(maxIter):
-        pair = findOverlapPair(obs)
-        if pair is None:
-            return obs
-        i, j = pair
-        moved = separatePair(cfg, obs[i], obs[j])
-        if moved is not None:
-            obs[i], obs[j] = moved
-        else:
-            obs[i] = shrinkObstacle(cfg, obs[i])
-            obs[j] = shrinkObstacle(cfg, obs[j])
-    return obs
+    """Return whether a layout overlaps itself or leaves the placement area."""
+    return layoutProblem(placementBounds(cfg), obstacles, [], -1, strict=False) is not None
 
 
 def tierPoints(d: float):
+    """Return the competition points awarded for one minimum distance."""
     for b, p in zip(TIER_BOUNDS, TIER_POINTS[:-1]):
         if d < b:
             return p
     return TIER_POINTS[-1]
 
 
-def officialTestScore(
-    distances: List[float],
-    obstacleCount: int,
-    executionDurations: List[float],
-):
-    """Return the official failure score for one test case."""
-    if not distances or not executionDurations:
+def shapingTerm(d: float):
+    """Return m(d): how close a distance is to the next better tier, in [0, 1].
+
+    Inside each tier the value falls linearly from 1 at the tier's lower
+    bound to 0 at its upper bound; beyond the last bound it decays
+    exponentially. So two distances in the same tier still compare by how
+    near they are to the next tier down.
+    """
+    if d >= TIER_BOUNDS[2]:
+        return math.exp(-(d - TIER_BOUNDS[2]))
+    if d >= TIER_BOUNDS[1]:
+        return (TIER_BOUNDS[2] - d) / (TIER_BOUNDS[2] - TIER_BOUNDS[1])
+    if d >= TIER_BOUNDS[0]:
+        return (TIER_BOUNDS[1] - d) / (TIER_BOUNDS[1] - TIER_BOUNDS[0])
+    return (TIER_BOUNDS[0] - d) / TIER_BOUNDS[0]
+
+
+def shapedPoints(d: float, shapeGain: float):
+    """Return g(d) = tierPoints(d) plus a bounded continuous nudge.
+
+    shapeGain must stay below 1 (the smallest real tier gap) so shaping can
+    never make a worse-tier candidate outscore a better-tier one; it only
+    breaks ties within a tier by real clearance.
+    """
+    return tierPoints(d) + shapeGain * shapingTerm(d)
+
+
+def scoreFromPoints(avgPoint: float, obstacleCount: int, flightDurations: List[float]):
+    """Return the official-formula score for an already-averaged point value."""
+    if not flightDurations:
         return 0.0
-    if len(distances) != len(executionDurations):
-        raise ValueError("each distance must have a matching execution duration")
     if obstacleCount <= 0:
         raise ValueError("obstacleCount must be positive")
-    if any(duration <= 0.0 for duration in executionDurations):
-        raise ValueError("execution durations must be positive")
-
-    avgPoint = statistics.fmean(tierPoints(distance) for distance in distances)
-    avgTimeMinutes = statistics.fmean(executionDurations) / 60.0
+    if any(duration <= 0.0 for duration in flightDurations):
+        raise ValueError("flight durations must be positive")
+    avgTimeMinutes = statistics.fmean(flightDurations) / 60.0
     return (avgPoint * 10.0) / ((obstacleCount ** 2) * avgTimeMinutes)
 
 
-def fitnessFor(
+def officialTestScore(
     distances: List[float],
     obstacleCount: int,
-    executionDurations: List[float],
+    flightDurations: List[float],
 ):
-    return -officialTestScore(distances, obstacleCount, executionDurations)
+    """Return the official failure score for one test case.
+
+    Distances are converted to points independently and then averaged.
+    Runtime is the average simulated flight time in minutes, taken from the
+    trajectory rather than wall-clock execution time, so the estimate is
+    independent of how many simulator workers were contending for the host.
+    The obstacle-count penalty is quadratic, exactly as specified by the
+    competition report.
+    """
+    if not distances or not flightDurations:
+        return 0.0
+    if len(distances) != len(flightDurations):
+        raise ValueError("each distance must have a matching flight duration")
+    avgPoint = statistics.fmean(tierPoints(distance) for distance in distances)
+    return scoreFromPoints(avgPoint, obstacleCount, flightDurations)
 
 
-def selectionKey(ind: Individual):
-    """Rank by score, then deterministic search tie-breakers."""
+def searchTestScore(
+    distances: List[float],
+    obstacleCount: int,
+    flightDurations: List[float],
+    shapeGain: float,
+    stuck: bool,
+    incompleteFactor: float,
+):
+    """Return a continuous, search-only analogue of officialTestScore.
+
+    Uses shapedPoints instead of raw tier points, so candidates tied on the
+    discrete tier are still ranked by real clearance; this is what makes the
+    fitness monotone instead of a staircase. Two tests in the same tier get
+    the same official score but different search scores, which keeps the
+    search pushing the distance down. Applies incompleteFactor when the run
+    never reached the goal, since the suite excludes stuck candidates
+    regardless of their distance, so a stuck layout should not out-breed a
+    completing one of similar quality.
+    """
+    if not distances or not flightDurations:
+        return 0.0
+    if len(distances) != len(flightDurations):
+        raise ValueError("each distance must have a matching flight duration")
+    avgPoint = statistics.fmean(shapedPoints(distance, shapeGain) for distance in distances)
+    completionFactor = incompleteFactor if stuck else 1.0
+    return scoreFromPoints(avgPoint, obstacleCount, flightDurations) * completionFactor
+
+
+def searchSelectionKey(ind: Individual):
+    """Return the sort key of the search phase, most important element first.
+
+    Ties on fitness go to the layout with fewer obstacles, then to the
+    closer approach, then to the shorter flight. Lower is better throughout.
+    """
     meanDistance = statistics.fmean(ind.distances) if ind.distances else float("inf")
     meanDuration = (
-        statistics.fmean(ind.executionDurations)
-        if ind.executionDurations
-        else float("inf")
+        statistics.fmean(ind.flightDurations) if ind.flightDurations else float("inf")
     )
     return ind.fitness, len(ind.obstacles), meanDistance, meanDuration
 
 
-def wgs84ToLocal(lat: float, lon: float, homeLat: float, homeLon: float):
-    # Equirectangular approximation; valid for the small mission area.
-    R = 6378137.0
-    dLat = math.radians(lat - homeLat)
-    dLon = math.radians(lon - homeLon)
-    return R * dLat, R * dLon * math.cos(math.radians(homeLat))
+def flightSeconds(trajectory):
+    """Return the simulated flight time in seconds, from the trajectory timestamps.
 
-
-def parseWaypoints(planPath: str):
-    # QGC .plan command codes: 22=takeoff, 16=waypoint, 21=land.
-    try:
-        with open(planPath) as fh:
-            plan = json.load(fh)
-        items = plan["mission"]["items"]
-        home = plan["mission"].get("plannedHomePosition", [0.0, 0.0, 0.0])
-        hLat, hLon = home[0], home[1]
-        wps: List[Waypoint] = [(0.0, 0.0)]
-        for item in items:
-            if item.get("command") in (16, 22, 21):
-                params = item.get("params", [])
-                if len(params) >= 6 and params[4] is not None and params[5] is not None:
-                    wps.append(wgs84ToLocal(params[4], params[5], hLat, hLon))
-        return wps
-    except Exception as e:
-        logger.warning("waypoint parse failed: %s", e)
-        return [(0.0, 0.0)]
+    Independent of wall-clock scheduling: two runs of the same layout on a
+    busy vs. idle host still report the same flight time, unlike
+    time.monotonic() around the simulator call.
+    """
+    positions = getattr(trajectory, "positions", None) if trajectory is not None else None
+    if not positions:
+        return 0.0
+    return (positions[-1].timestamp - positions[0].timestamp) / 1_000_000.0
 
 
 def reachedGoal(trajectory, goalXY: Waypoint, tol: float):
+    """Return whether the flight ended within tol metres of the goal."""
     # Trajectory.positions may be empty when ALLIGN_ORIGIN runs against a
     # truncated log; treat missing data as "did not reach" so the watchdog
     # path and the unfinished-flight path collapse into the same flag.
@@ -350,287 +311,107 @@ def reachedGoal(trajectory, goalXY: Waypoint, tol: float):
     return math.hypot(last.x - goalXY[0], last.y - goalXY[1]) <= tol
 
 
-def pickSegment(rng: random.Random, waypoints: List[Waypoint]):
-    # Weight by segment length so short segments (e.g. home->takeoff ~0.5 m)
-    # are not sampled as often as the main flight leg (~50 m).
-    lengths = [
-        math.hypot(waypoints[i + 1][0] - waypoints[i][0], waypoints[i + 1][1] - waypoints[i][1])
-        for i in range(len(waypoints) - 1)
-    ]
-    total = sum(lengths)
-    if total < 1e-9:
-        return rng.randrange(len(waypoints) - 1)
-    return rng.choices(range(len(waypoints) - 1), weights=lengths, k=1)[0]
-
-
-def anchorOnPath(rng: random.Random, waypoints: List[Waypoint]):
-    i = pickSegment(rng, waypoints)
-    a, b = waypoints[i], waypoints[i + 1]
-    t = rng.random()
-    return (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
-
-
-def sizeTierBounds(lo: float, hi: float, idx: int):
-    # Lower bound rises with lower idx; upper bound is always hi.
-    # idx 0: [lo+2*step, hi], idx 1: [lo+step, hi], idx 2+: [lo, hi]
-    step = (hi - lo) / 3.0
-    return lo + (2 - min(idx, 2)) * step, hi
-
-
-def randomObstacle(
-    rng: random.Random,
-    cfg: GAConfig,
-    waypoints: Optional[List[Waypoint]] = None,
-    idx: int = 0,
-):
-    if waypoints is not None and len(waypoints) >= 2:
-        ax, ay = anchorOnPath(rng, waypoints)
-        x = clamp(ax + rng.gauss(0, cfg.pathSigma), cfg.xMin, cfg.xMax)
-        y = clamp(ay + rng.gauss(0, cfg.pathSigma), cfg.yMin, cfg.yMax)
-    else:
-        x = rng.uniform(cfg.xMin, cfg.xMax)
-        y = rng.uniform(cfg.yMin, cfg.yMax)
-    lLo, lHi = sizeTierBounds(cfg.lMin, cfg.lMax, idx)
-    wLo, wHi = sizeTierBounds(cfg.wMin, cfg.wMax, idx)
-    size = Obstacle.Size(l=rng.uniform(lLo, lHi), w=rng.uniform(wLo, wHi), h=cfg.hFixed)
-    position = Obstacle.Position(x=x, y=y, z=0, r=rng.uniform(cfg.rMin, cfg.rMax))
-    return Obstacle(size, position)
-
-
-def obstacleCountSchedule(popSize: int):
-    # The score divides by obstacles^2, so favor single-obstacle layouts while
-    # still seeding pairs that can form a trap.
-    return [[1, 1, 2][k % 3] for k in range(popSize)]
-
-
-def randomIndividual(
-    rng: random.Random,
-    cfg: GAConfig,
-    waypoints: Optional[List[Waypoint]] = None,
-    n: Optional[int] = None,
-):
-    if n is None:
-        n = rng.randint(1, cfg.maxObstacles)
-    obstacles: List[Obstacle] = []
-    for _ in range(cfg.maxRetries):
-        obstacles = [randomObstacle(rng, cfg, waypoints, idx) for idx in range(n)]
-        if not invalidLayout(cfg, obstacles):
-            return Individual(obstacles=obstacles)
-        if n > 1:
-            obstacles = resolveOverlaps(cfg, obstacles)
-            if not invalidLayout(cfg, obstacles):
-                return Individual(obstacles=obstacles)
-    return Individual(obstacles=obstacles)
-
-
-def oppositeSide(s: str):
-    return SIDE_RIGHT if s == SIDE_LEFT else SIDE_LEFT
-
-
-def sideSchedule(rng: random.Random, n: int):
-    # First obstacle picks a random side; the second is forced opposite so
-    # the GA does not pile both onto the same flank (which the logs showed
-    # was the main failure mode of the previous seeding). The third, when
-    # present, is random again so both sides keep getting explored.
-    if n == 1:
-        return [rng.choice([SIDE_LEFT, SIDE_RIGHT])]
-    if n == 2:
-        first = rng.choice([SIDE_LEFT, SIDE_RIGHT])
-        return [first, oppositeSide(first)]
-    if n == 3:
-        first = rng.choice([SIDE_LEFT, SIDE_RIGHT])
-        return [first, oppositeSide(first), rng.choice([SIDE_LEFT, SIDE_RIGHT])]
-    return []
-
-
-def oppositeLong(s: str):
-    return LONG_REAR if s == LONG_FRONT else LONG_FRONT
-
-
-def longitudinalSchedule(rng: random.Random, n: int):
-    # First obstacle picks a random half; the second copies it so the pair
-    # crowds the same half (forcing the planner to navigate around a cluster);
-    # the third, when present, is forced opposite so the path has obstacles in
-    # both halves and the drone cannot stay on one easy side of the segment.
-    if n == 1:
-        return [rng.choice([LONG_FRONT, LONG_REAR])]
-    if n == 2:
-        first = rng.choice([LONG_FRONT, LONG_REAR])
-        return [first, first]
-    if n == 3:
-        first = rng.choice([LONG_FRONT, LONG_REAR])
-        return [first, first, oppositeLong(first)]
-    return []
-
-
-def thinWall(
-    rng: random.Random,
-    cfg: GAConfig,
-    waypoints: List[Waypoint],
-    i: int,
-    t: float,
-    lateral: float,
-    crossingDeg: float,
-):
-    a, b = waypoints[i], waypoints[i + 1]
-    dx, dy = b[0] - a[0], b[1] - a[1]
-    segLen = math.hypot(dx, dy)
-    if segLen < 1e-6:
-        return randomObstacle(rng, cfg, waypoints)
-    x = clamp(a[0] + t * dx - lateral * dy / segLen, cfg.xMin, cfg.xMax)
-    y = clamp(a[1] + t * dy + lateral * dx / segLen, cfg.yMin, cfg.yMax)
-    jitter = rng.uniform(-WALL_JITTER_DEG, WALL_JITTER_DEG)
-    r = (math.degrees(math.atan2(dy, dx)) - crossingDeg + jitter) % 180.0
-    l, w = rng.uniform(*WALL_LENGTH_M), rng.uniform(*WALL_THICKNESS_M)
-    if r > 90.0:
-        # Swapping length and width represents the same box rotated by 90 degrees.
-        r, l, w = r - 90.0, w, l
-    return Obstacle(
-        Obstacle.Size(l=l, w=w, h=cfg.hFixed),
-        Obstacle.Position(x=x, y=y, z=0, r=r),
+def isFlakeRun(cfg: GAConfig, trajectory, goalXY, distances: List[float], label: str):
+    """Return whether a run missed the goal without ever coming near an obstacle."""
+    # Such a flight says nothing about the layout: the drone stopped on its own,
+    # so the run is treated as a simulator flake instead of as a measurement.
+    if goalXY is None or reachedGoal(trajectory, goalXY, cfg.goalTol):
+        return False
+    if not distances or min(distances) <= cfg.flakeObstacleDistanceM:
+        return False
+    logger.warning(
+        "%sflake: goal not reached and every obstacle stayed more than %.1fm away",
+        label,
+        cfg.flakeObstacleDistanceM,
     )
+    return True
 
 
-def trapObstacles(rng: random.Random, cfg: GAConfig, waypoints: List[Waypoint], n: int):
-    i = pickSegment(rng, waypoints)
-    segLen = max(math.dist(waypoints[i], waypoints[i + 1]), 1e-6)
-    t = rng.uniform(0.35, 0.5)
-    side = DIAG_SIDE
-    offset = side * rng.uniform(*DIAG_OFFSET_M)
-    walls = [thinWall(rng, cfg, waypoints, i, t, offset, side * DIAG_CROSSING_DEG)]
-    if n >= 2:
-        t += rng.uniform(*BLOCKER_GAP_M) / segLen
-        offset = -side * rng.uniform(*BLOCKER_OFFSET_M)
-        walls.append(thinWall(rng, cfg, waypoints, i, t, offset, 90.0))
-    return walls
+def obstacleCountSchedule(popSize: int, gateShare: float = 0.3):
+    """Return the obstacle-count quota of one generation, gates spread evenly."""
+    # One or two obstacles only: the score is divided by obstacles^2, so a
+    # three-obstacle test cannot beat a mediocre single wall. Gates get a
+    # fixed share of every generation (6 of 20 by default): a pair only beats
+    # a single when it causes a crash, and free selection would wipe the
+    # pairs out before they get that chance.
+    gates = round(popSize * gateShare)
+    return [2 if (k + 1) * gates // popSize > k * gates // popSize else 1 for k in range(popSize)]
 
 
-def corridorObstacle(
+def mutationScaleAt(cfg: GAConfig, gen: int):
+    """Return the mutation step scale for the children of generation gen."""
+    # Geometric decay from the first children on, never below a quarter of
+    # the measured sigmas: below that a step no longer moves the response.
+    # At the shipped 1.0 / 1.0 this is a constant 1.0; the knob exists for
+    # the annealing arm of the tuning study.
+    return max(0.25, cfg.mutationScale * cfg.mutationDecay ** max(0, gen - 1))
+
+
+def nicheOf(ind: Individual):
+    """Return the niche an individual belongs which is its obstacle count."""
+    return len(ind.obstacles)
+
+
+def buildIndividual(cfg: GAConfig, genes: Genes, segments: List[Segment], strict: bool):
+    """Decode the genes; return the individual, or None if the layout is unusable."""
+    obstacles = decode(genes, segments)
+    problem = layoutProblem(placementBounds(cfg), obstacles, segments, genes.segment, strict)
+    if problem is not None:
+        logger.debug("rejected %s: %s", genes, problem)
+        return None
+    return Individual(obstacles=obstacles, genes=genes)
+
+
+def freshIndividual(
     rng: random.Random,
     cfg: GAConfig,
-    waypoints: List[Waypoint],
-    side: str = SIDE_LEFT,
-    longitudinal: str = LONG_FRONT,
+    segments: List[Segment],
+    segmentChoices: List[int],
+    n: int,
 ):
-    i = pickSegment(rng, waypoints)
-    t = rng.uniform(0.5, 1.0) if longitudinal == LONG_FRONT else rng.uniform(0.0, 0.5)
-    sign = 1.0 if side == SIDE_LEFT else -1.0
-    return thinWall(
-        rng,
-        cfg,
-        waypoints,
-        i,
-        t,
-        sign * rng.uniform(0.0, LATERAL_MAX_M),
-        90.0,
-    )
+    """Return a fresh seed with n obstacles (1 wall, 2 gate) whose layout is legal.
+
+    Draws random genes until one decodes to a legal layout. The first pass
+    also rejects walls that cut another segment; if seedDraws draws all
+    fail (segments packed too close), a second pass allows the crossing
+    rather than leaving the slot empty.
+    """
+    kind = KIND_BY_COUNT[n]
+    for strict in (True, False):
+        for _ in range(cfg.seedDraws):
+            genes = randomGenes(rng, kind, segmentChoices, cfg.seedSides)
+            ind = buildIndividual(cfg, genes, segments, strict)
+            if ind is not None:
+                if not strict:
+                    logger.info("seed accepted although a wall crosses another segment: %s", genes)
+                return ind
+    logger.warning("no legal %s layout found on segments %s; the slot is skipped", kind, segmentChoices)
+    return Individual(obstacles=decode(genes, segments), genes=genes, illegal=True)
 
 
-def seededIndividual(
+def childOf(rng: random.Random, cfg: GAConfig, segments: List[Segment], a: Individual, b: Individual, scale: float = 1.0):
+    """Return the child of two parents, or None if it decodes to an unusable layout."""
+    # Uniform crossover inside the parents' frame, then exactly one gene is
+    # moved, so every child differs from both parents by a measurable step.
+    genes = mutateGenes(rng, crossoverGenes(rng, a.genes, b.genes), scale)
+    return buildIndividual(cfg, genes, segments, strict=True)
+
+
+def tournament(
     rng: random.Random,
     cfg: GAConfig,
-    waypoints: List[Waypoint],
-    n: Optional[int] = None,
+    pop: List[Individual],
+    niche: Optional[int] = None,
 ):
-    # Use validated trap layouts for one or two obstacles. Three-obstacle
-    # layouts retain the side and longitudinal schedules.
-    if n is None:
-        n = rng.randint(1, cfg.maxObstacles)
-    sides = sideSchedule(rng, n)
-    longs = longitudinalSchedule(rng, n)
-    for _ in range(cfg.maxRetries):
-        if n <= 2:
-            obstacles = trapObstacles(rng, cfg, waypoints, n)
-        else:
-            obstacles = [
-                corridorObstacle(rng, cfg, waypoints, sides[idx], longs[idx])
-                for idx in range(n)
-            ]
-        if not invalidLayout(cfg, obstacles):
-            return Individual(obstacles=obstacles)
-        if n > 1:
-            obstacles = resolveOverlaps(cfg, obstacles)
-            if not invalidLayout(cfg, obstacles):
-                return Individual(obstacles=obstacles)
-    logger.info("seeded retries exhausted for n=%d, falling back to randomIndividual", n)
-    return randomIndividual(rng, cfg, waypoints, n)
-
-
-def crossover(rng: random.Random, a: Individual, b: Individual):
-    # Positional crossover: for each slot index pick the obstacle from parent A
-    # or B at that position. This preserves structured arrangements (e.g. a
-    # left+right flanking pair) instead of shuffling the merged pool arbitrarily.
-    n = rng.choice([len(a.obstacles), len(b.obstacles)])
-    result = []
-    for i in range(n):
-        if i < len(a.obstacles) and i < len(b.obstacles):
-            src = a if rng.random() < 0.5 else b
-        elif i < len(a.obstacles):
-            src = a
-        else:
-            src = b
-        result.append(copy.deepcopy(src.obstacles[i]))
-    return Individual(obstacles=result)
-
-
-def mutate(
-    rng: random.Random,
-    cfg: GAConfig,
-    ind: Individual,
-    waypoints: Optional[List[Waypoint]] = None,
-):
-    # Obstacle.Size and Obstacle.Position are NamedTuples (immutable);
-    # mutate by constructing a fresh Obstacle so internal geometry is rebuilt.
-    for idx, o in enumerate(ind.obstacles):
-        l = (
-            gaussianPerturb(rng, o.size.l, cfg.lMin, cfg.lMax, cfg.sigmaFrac)
-            if rng.random() < cfg.mutationRate
-            else o.size.l
-        )
-        w = (
-            gaussianPerturb(rng, o.size.w, cfg.wMin, cfg.wMax, cfg.sigmaFrac)
-            if rng.random() < cfg.mutationRate
-            else o.size.w
-        )
-        x = (
-            gaussianPerturb(rng, o.position.x, cfg.xMin, cfg.xMax, cfg.sigmaFrac)
-            if rng.random() < cfg.mutationRate
-            else o.position.x
-        )
-        y = (
-            gaussianPerturb(rng, o.position.y, cfg.yMin, cfg.yMax, cfg.sigmaFrac)
-            if rng.random() < cfg.mutationRate
-            else o.position.y
-        )
-        r = (
-            gaussianPerturb(rng, o.position.r, cfg.rMin, cfg.rMax, cfg.sigmaFrac)
-            if rng.random() < cfg.mutationRate
-            else o.position.r
-        )
-        ind.obstacles[idx] = Obstacle(
-            Obstacle.Size(l=l, w=w, h=cfg.hFixed),
-            Obstacle.Position(x=x, y=y, z=0, r=r),
-        )
-    addProb = cfg.addProb if len(ind.obstacles) < 2 else cfg.addProb / 10.0
-    if rng.random() < addProb and len(ind.obstacles) < cfg.maxObstacles:
-        if waypoints is not None and len(waypoints) >= 2:
-            side = rng.choice([SIDE_LEFT, SIDE_RIGHT])
-            longitudinal = rng.choice([LONG_FRONT, LONG_REAR])
-            ind.obstacles.append(corridorObstacle(rng, cfg, waypoints, side, longitudinal))
-        else:
-            ind.obstacles.append(randomObstacle(rng, cfg, waypoints, len(ind.obstacles)))
-    if rng.random() < cfg.removeProb and len(ind.obstacles) > 1:
-        ind.obstacles.pop(rng.randrange(len(ind.obstacles)))
-    # Perturbed positions/sizes and the add step can introduce overlaps; clean
-    # them up here so nextGeneration's invalidLayout retry loop is rarely hit.
-    if len(ind.obstacles) > 1 and hasOverlap(ind.obstacles):
-        ind.obstacles = resolveOverlaps(cfg, ind.obstacles)
-    return ind
-
-
-def tournament(rng: random.Random, cfg: GAConfig, pop: List[Individual]):
-    contenders = rng.sample(pop, min(cfg.tournamentK, len(pop)))
-    return min(contenders, key=selectionKey)
+    """Return the best of tournamentK individuals sampled inside one niche."""
+    # Restricting the sample to a single obstacle count is what protects the
+    # niches: with a global tournament the pair quota gets refilled with
+    # children of singles and the pair motif disappears in a few generations.
+    pool = [ind for ind in pop if (niche is None or nicheOf(ind) == niche) and not ind.illegal]
+    if not pool:
+        pool = pop
+    contenders = rng.sample(pool, min(cfg.tournamentK, len(pool)))
+    return min(contenders, key=searchSelectionKey)
 
 
 # Anything spawned by roslaunch inherits the pipe write end Aerialist polls on;
@@ -656,6 +437,7 @@ _STALE_GLOBS = ("/tmp/px4-sock-*", "/tmp/px4_lock-*")
 
 
 def cleanupSimState():
+    """Kill leftover simulator processes and delete the stale PX4 files."""
     # SIGTERM first so processes flush stdout and release pipes cleanly;
     # SIGKILL the survivors after a brief grace period.
     for signame in ("-TERM", "-KILL"):
@@ -677,13 +459,15 @@ def cleanupSimState():
 
 
 def armWatchdog(killAfter: float):
-    # Returns (timer, killedFlag). The flag is a 1-element list so the timer
-    # callback can mutate it without a nonlocal binding; cleanupSimState pkills
-    # PX4/Gazebo which unblocks agent.run() with an exception.
+    """Start a timer that kills a simulation still running after killAfter seconds."""
+    # The returned flag is a 1-element list so the timer callback can mutate it
+    # without a nonlocal binding; cleanupSimState pkills PX4/Gazebo, which
+    # unblocks agent.run() with an exception.
     if killAfter <= 0:
         return None, [False]
     killed = [False]
     def watchdog():
+        """Kill the simulation and record that the watchdog fired."""
         killed[0] = True
         cleanupSimState()
     timer = threading.Timer(killAfter, watchdog)
@@ -699,35 +483,44 @@ def evaluate(
     goalXY: Optional[Waypoint] = None,
     killAfter: float = 0.0,
 ):
+    """Run one simulation for an individual and store its distance and fitness."""
     if invalidLayout(cfg, ind.obstacles):
         ind.fitness = float("inf")
         ind.valid = False
-        return False
+        ind.illegal = True
+        return AttemptOutcome.SKIPPED
     isolated = is_isolated_execution()
     timer, killed = (None, [False]) if isolated else armWatchdog(killAfter)
     t0 = time.monotonic()
     try:
         tc = TestCase(caseStudy, ind.obstacles)
-        executionStarted = time.monotonic()
         tc.execute()
-        executionDuration = time.monotonic() - executionStarted
         distances = tc.get_distances()
         if not distances:
             raise RuntimeError("no distances")
         minDist = float(min(distances))
-        # "minimum_distance:" kept verbatim so external grep-based scorers keep matching.
-        logger.info("minimum_distance:%s", minDist)
+        # "minimum_distance:" kept verbatim so external grep-based scorers keep
+        # matching; the obstacle count feeds the lab's campaign summary plot.
+        logger.info("minimum_distance:%s obstacle_count=%d", minDist, len(ind.obstacles))
+        # Threads interleave log lines, so repeat the distance next to the genes.
+        logger.info("evaluated %s -> %.3f m", ind.genes, minDist)
+        if isFlakeRun(cfg, tc.trajectory, goalXY, distances, ""):
+            return AttemptOutcome.FLAKE
         tc.plot()
         ind.testCase = tc
         ind.distances.append(minDist)
-        ind.executionDurations.append(max(executionDuration, 1e-9))
+        ind.flightDurations.append(max(flightSeconds(tc.trajectory), 1e-9))
+        ind.trajectories.append(tc.trajectory)
         if goalXY is not None and not reachedGoal(tc.trajectory, goalXY, cfg.goalTol):
             ind.stuck = True
             logger.info("stuck: final trajectory point not within %.1fm of goal", cfg.goalTol)
-        ind.fitness = fitnessFor(
-            ind.distances, len(ind.obstacles), ind.executionDurations
+        ind.officialScore = officialTestScore(
+            ind.distances, len(ind.obstacles), ind.flightDurations
         )
-        ind.officialScore = -ind.fitness
+        ind.fitness = -searchTestScore(
+            ind.distances, len(ind.obstacles), ind.flightDurations,
+            cfg.shapeGain, ind.stuck, cfg.incompleteFactor,
+        )
         ind.valid = True
     except Exception as e:
         if killed[0]:
@@ -743,7 +536,7 @@ def evaluate(
         ind.duration = time.monotonic() - t0
         if not isolated:
             cleanupSimState()
-    return True
+    return AttemptOutcome.CONSUMED
 
 
 def rerun(
@@ -753,43 +546,48 @@ def rerun(
     goalXY: Optional[Waypoint] = None,
     killAfter: float = 0.0,
 ):
+    """Run an already evaluated layout again and append the new measurement."""
     isolated = is_isolated_execution()
     timer, killed = (None, [False]) if isolated else armWatchdog(killAfter)
     t0 = time.monotonic()
-    executionStarted = t0
-    executionDuration = 0.0
     try:
         tc = TestCase(caseStudy, copy.deepcopy(ind.obstacles))
-        executionStarted = time.monotonic()
         tc.execute()
-        executionDuration = time.monotonic() - executionStarted
         distances = tc.get_distances()
         if not distances:
             raise RuntimeError("no distances")
         minDist = float(min(distances))
         logger.info("rerun minimum_distance:%s", minDist)
+        if isFlakeRun(cfg, tc.trajectory, goalXY, distances, "rerun "):
+            return AttemptOutcome.FLAKE
         tc.plot()
         ind.distances.append(minDist)
+        ind.flightDurations.append(max(flightSeconds(tc.trajectory), 1e-9))
+        ind.trajectories.append(tc.trajectory)
         ind.testCase = tc
         if goalXY is not None and not reachedGoal(tc.trajectory, goalXY, cfg.goalTol):
             ind.stuck = True
             logger.info("stuck on rerun: final point not within %.1fm of goal", cfg.goalTol)
     except Exception as e:
-        executionDuration = time.monotonic() - executionStarted
         if killed[0]:
             ind.stuck = True
             logger.info("stuck on rerun: watchdog killed run after %.1fs", time.monotonic() - t0)
         else:
-            # A finite sentinel records the official zero-point tier.
+            # A finite sentinel records this execution in the official zero-point
+            # tier while keeping the three-run average well-defined.
             logger.warning("rerun failed (penalised with sentinel %s): %s", cfg.failSentinel, e)
         ind.distances.append(cfg.failSentinel)
+        # No trajectory survives a failed run, so flight time cannot be
+        # measured; the watchdog ceiling already passed to this call is a
+        # conservative stand-in that keeps the failure's weight bounded.
+        ind.flightDurations.append(max(killAfter, 1e-9))
     finally:
-        ind.executionDurations.append(max(executionDuration, 1e-9))
         if timer is not None:
             timer.cancel()
         ind.duration = time.monotonic() - t0
         if not isolated:
             cleanupSimState()
+    return AttemptOutcome.CONSUMED
 
 
 def runParallelBatch(cfg: GAConfig, jobs, operation, label: str):
@@ -798,6 +596,7 @@ def runParallelBatch(cfg: GAConfig, jobs, operation, label: str):
         return []
 
     def timedOperation(job):
+        """Run one job and return its result together with its duration."""
         started = time.monotonic()
         result = operation(*job)
         return result, time.monotonic() - started
@@ -809,6 +608,7 @@ def runParallelBatch(cfg: GAConfig, jobs, operation, label: str):
     else:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ga-sim") as pool:
             futures = [pool.submit(timedOperation, job) for job in jobs]
+            # Preserve population order even though execution is concurrent.
             completed = [future.result() for future in futures]
     wall = time.monotonic() - started
     results = [result for result, _ in completed]
@@ -825,58 +625,130 @@ def runParallelBatch(cfg: GAConfig, jobs, operation, label: str):
     return results
 
 
+def runRetryingBatch(cfg: GAConfig, jobs, operation, label: str, attemptBudget: int):
+    """Run the jobs in waves, retrying flakes, and return the attempts used."""
+    pending = [(job, 0) for job in jobs]
+    attemptsUsed = 0
+    wave = 0
+    while pending and attemptsUsed < attemptBudget:
+        capacity = min(cfg.parallelWorkers, attemptBudget - attemptsUsed)
+        batch = []
+        deferred = []
+        batched = set()
+        for item in pending:
+            # Two attempts on the same individual would append to the same
+            # distance list, so they must not share a wave.
+            individualId = id(item[0][1])
+            if len(batch) < capacity and individualId not in batched:
+                batched.add(individualId)
+                batch.append(item)
+            else:
+                deferred.append(item)
+        pending = deferred
+        if not batch:
+            break
+        outcomes = runParallelBatch(
+            cfg,
+            [job for job, _ in batch],
+            operation,
+            f"{label} wave {wave}",
+        )
+        retries = []
+        for (job, retryCount), outcome in zip(batch, outcomes):
+            if outcome != AttemptOutcome.SKIPPED:
+                attemptsUsed += 1
+            if outcome == AttemptOutcome.FLAKE:
+                if retryCount < cfg.maxFlakeRetries:
+                    retries.append((job, retryCount + 1))
+                else:
+                    logger.warning(
+                        "%s: dropping measurement after %d flake retries",
+                        label,
+                        retryCount,
+                    )
+        # Retry flakes before spending the remaining budget on new jobs.
+        pending = retries + pending
+        wave += 1
+    return attemptsUsed
+
+
+def nicheChild(
+    rng: random.Random,
+    cfg: GAConfig,
+    pop: List[Individual],
+    niche: int,
+    segments: List[Segment],
+    segmentChoices: List[int],
+    scale: float = 1.0,
+):
+    """Return one new individual for a niche, bred from parents of that niche."""
+    if any(nicheOf(ind) == niche and not ind.illegal for ind in pop):
+        for _ in range(cfg.maxRetries):
+            child = childOf(rng, cfg, segments, tournament(rng, cfg, pop, niche), tournament(rng, cfg, pop, niche), scale)
+            if child is not None:
+                return child
+    # The niche is extinct, or breeding keeps producing illegal layouts:
+    # reseed the slot from the motifs instead of borrowing another niche.
+    return freshIndividual(rng, cfg, segments, segmentChoices, niche)
+
+
+def nicheGeneration(
+    rng: random.Random,
+    cfg: GAConfig,
+    pop: List[Individual],
+    niche: int,
+    quota: int,
+    segments: List[Segment],
+    segmentChoices: List[int],
+    scale: float = 1.0,
+):
+    """Return the quota slots of one niche: its own elites plus new children."""
+    # The elite count is capped one below the quota so a niche always keeps at
+    # least one slot to explore with, however small the population is.
+    pool = [ind for ind in pop if nicheOf(ind) == niche]
+    eliteCount = min(cfg.elitePerNiche, len(pool), max(0, quota - 1))
+    children = sorted(pool, key=searchSelectionKey)[:eliteCount]
+    immigrants = int(round(cfg.immigrantShare * (quota - eliteCount)))
+    while len(children) < quota:
+        if len(children) >= quota - immigrants:
+            children.append(freshIndividual(rng, cfg, segments, segmentChoices, niche))
+        else:
+            children.append(nicheChild(rng, cfg, pop, niche, segments, segmentChoices, scale))
+    return children
+
+
 def nextGeneration(
     rng: random.Random,
     cfg: GAConfig,
     pop: List[Individual],
-    waypoints: Optional[List[Waypoint]] = None,
+    segments: List[Segment],
+    segmentChoices: List[int],
+    scale: float = 1.0,
 ):
-    eliteCount = min(cfg.eliteSize, len(pop))
-    elites = sorted(pop, key=selectionKey)[:eliteCount]
-    children: List[Individual] = list(elites)
-    while len(children) < cfg.popSize:
-        child: Optional[Individual] = None
-        for _ in range(cfg.maxRetries):
-            c = mutate(
-                rng,
-                cfg,
-                crossover(rng, tournament(rng, cfg, pop), tournament(rng, cfg, pop)),
-                waypoints,
-            )
-            if not invalidLayout(cfg, c.obstacles):
-                child = c
-                break
-        if child is None:
-            for _ in range(cfg.maxRetries):
-                c = randomIndividual(rng, cfg, waypoints)
-                if not invalidLayout(cfg, c.obstacles):
-                    child = c
-                    break
-        if child is None:
-            child = randomIndividual(rng, cfg, waypoints)
-        children.append(child)
-    return children
-
-
-def obsSignature(ind: Individual):
-    pts = [(o.position.x, o.position.y) for o in ind.obstacles]
-    if not pts:
-        return (0.0, 0.0)
-    return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
-
-
-def isTooSimilar(cfg: GAConfig, cand: Individual, selected: List[Individual]):
-    cx, cy = obsSignature(cand)
-    for s in selected:
-        sx, sy = obsSignature(s)
-        if math.hypot(cx - sx, cy - sy) < cfg.diversityMinM:
-            return True
-    return False
+    """Return the next generation, one protected niche per obstacle count."""
+    counts = obstacleCountSchedule(cfg.popSize, cfg.gateShare)
+    queues = {
+        niche: nicheGeneration(rng, cfg, pop, niche, counts.count(niche), segments, segmentChoices, scale)
+        for niche in set(counts)
+    }
+    # Emit in schedule order so the population keeps the layout of generation 0.
+    return [queues[niche].pop(0) for niche in counts]
 
 
 class GeneticGenerator:
+    """Two-phase generator: discover layouts, then rerun the promising ones."""
+
     def __init__(self, missionPath: str, config: Optional[GAConfig] = None):
+        """Load the mission, fix the random seed and parse the flight segments."""
         cfg = config or GAConfig()
+        # GA_SEED in the environment repeats a run exactly; an explicit
+        # cfg.seed still wins. Without either, a fresh seed is drawn and logged.
+        envSeed = os.environ.get("GA_SEED")
+        if cfg.seed is None and envSeed is not None:
+            cfg = replace(cfg, seed=int(envSeed))
+        # GA_EVOLVE=0 switches breeding off for the seed-only measurement arm.
+        if os.environ.get("GA_EVOLVE", "1") == "0":
+            cfg = replace(cfg, evolve=False)
         # Resolve the seed up front so it appears in logs and on cfg, then build
         # a private RNG instance: no calls into the process-wide random module.
         resolvedSeed = (
@@ -886,11 +758,24 @@ class GeneticGenerator:
         self.rng = random.Random(resolvedSeed)
         logger.info("GA seed: %s", resolvedSeed)
         self.caseStudy = AerialistTest.from_yaml(missionPath)
-        planPath = self.caseStudy.robot.mission_file if self.caseStudy.robot else None
-        self.waypoints = parseWaypoints(planPath) if planPath else [(0.0, 0.0)]
+        self.waypoints = parseWaypoints(self.caseStudy.robot.mission_file)
+        self.segments = allSegments(self.waypoints)
+        # Seeds go on the long segments; a mission made of short hops only would
+        # fall back to every segment it has.
+        self.seedSegments = [segment.index for segment in longSegments(self.waypoints)] or [segment.index for segment in self.segments]
         logger.info("waypoints: %s", self.waypoints)
+        logger.info("seed segments: %s", self.seedSegments)
+
+    def rescore(self, cfg: GAConfig, ind: Individual):
+        """Recompute the two scores of an individual from all of its runs."""
+        ind.officialScore = officialTestScore(ind.distances, len(ind.obstacles), ind.flightDurations)
+        ind.fitness = -searchTestScore(
+            ind.distances, len(ind.obstacles), ind.flightDurations,
+            cfg.shapeGain, ind.stuck, cfg.incompleteFactor,
+        )
 
     def generate(self, budget: int):
+        """Return the best test cases found within a budget of simulator runs."""
         cfg = self.config
         if budget <= 0:
             logger.error("budget must be > 0")
@@ -908,92 +793,125 @@ class GeneticGenerator:
             effectivePopSize = max(2, round(math.sqrt(budget)))
             cfg = replace(cfg, popSize=effectivePopSize)
 
-        # Reserve refinement budget only when phase 1 can still run one full population.
+        # Reserve refinement budget only when discovery can still run one full population.
+        # Any reserve that cannot be spent on useful reruns is returned to discovery.
         phase1Budget = min(budget, max(cfg.popSize, int((1 - cfg.refineFraction) * budget)))
         phase2Budget = budget - phase1Budget
 
-        # Max generations: how many full populations fit inside the phase-1 budget
-        # (minus 1 for the initial population that is evaluated before evolution starts).
-        maxGen = max(1, phase1Budget // cfg.popSize - 1)
-
         logger.info(
-            "GA: budget=%s pop=%s workers=%s maxGen=%s phase1=%s phase2=%s",
+            "GA: budget=%s pop=%s workers=%s discovery=%s refinement-reserve=%s evolve=%s",
             budget,
             cfg.popSize,
             cfg.parallelWorkers,
-            maxGen,
             phase1Budget,
             phase2Budget,
+            cfg.evolve,
         )
 
-        # Goal == last mission waypoint; parseWaypoints falls back to [(0,0)]
-        # when the .plan is missing, in which case we cannot detect "stuck".
-        goalXY = self.waypoints[-1] if len(self.waypoints) >= 2 else None
+        # Goal == last mission waypoint, used for the stuck check.
+        goalXY = self.waypoints[-1]
         maxGoodDuration = 0.0
 
-        useCorridorSeed = len(self.waypoints) >= 2
-        counts = obstacleCountSchedule(cfg.popSize)
+        counts = obstacleCountSchedule(cfg.popSize, cfg.gateShare)
         logger.info("initial obstacle counts: %s", counts)
-        pop = [
-            seededIndividual(self.rng, cfg, self.waypoints, n) if useCorridorSeed
-            else randomIndividual(self.rng, cfg, self.waypoints, n)
-            for n in counts
-        ]
+        pop = [freshIndividual(self.rng, cfg, self.segments, self.seedSegments, n) for n in counts]
         evaluated: List[Individual] = []
-        simsUsed = 0
+        discoveryAttempts = 0
         gen = 0
-        while simsUsed < phase1Budget and gen < maxGen:
-            remaining = phase1Budget - simsUsed
-            candidates = [ind for ind in pop if not ind.valid][:remaining]
-            killAfter = max(cfg.minTimeout, cfg.timeoutMul * maxGoodDuration)
-            jobs = [(cfg, ind, self.caseStudy, goalXY, killAfter) for ind in candidates]
-            consumedResults = runParallelBatch(cfg, jobs, evaluate, f"generation {gen}")
-            for ind, consumed in zip(candidates, consumedResults):
-                if ind.valid:
-                    evaluated.append(ind)
-                    # Only reached-goal runs feed the threshold; otherwise a slow
-                    # stuck run would inflate the budget and disarm the watchdog.
-                    if not ind.stuck and ind.duration > maxGoodDuration:
-                        maxGoodDuration = ind.duration
-                if consumed:
-                    simsUsed += 1
-            best = min(pop, key=selectionKey)
-            logger.info(
-                "[gen %d] best official score=%.4f sims=%d/%d",
-                gen,
-                best.officialScore,
-                simsUsed,
-                phase1Budget,
-            )
-            if simsUsed >= phase1Budget:
-                break
-            pop = nextGeneration(self.rng, cfg, pop, self.waypoints)
-            gen += 1
+        noProgressLimit = max(3, cfg.maxRetries)
 
-        # Phase 2: rerun promising single-shot candidates to filter flaky near-misses.
-        promising = sorted(
-            [i for i in evaluated if i.distances and i.distances[0] < cfg.refineThreshold],
-            key=selectionKey,
-        )
-        simsLeft = phase2Budget
+        def runDiscovery(attemptBudget: int):
+            """Spend up to attemptBudget simulations on new layouts."""
+            nonlocal pop, gen, maxGoodDuration
+            attemptsUsed = 0
+            noProgressRounds = 0
+
+            while attemptsUsed < attemptBudget and noProgressRounds < noProgressLimit:
+                remaining = attemptBudget - attemptsUsed
+                freeSlots = [idx for idx, ind in enumerate(pop) if not ind.valid and not ind.illegal]
+                if not freeSlots:
+                    gen += 1
+                    if cfg.evolve:
+                        pop = nextGeneration(self.rng, cfg, pop, self.segments, self.seedSegments, mutationScaleAt(cfg, gen))
+                    else:
+                        pop = [freshIndividual(self.rng, cfg, self.segments, self.seedSegments, n) for n in counts]
+                    freeSlots = [idx for idx, ind in enumerate(pop) if not ind.valid and not ind.illegal]
+                candidates = [pop[idx] for idx in freeSlots[:remaining]]
+
+                killAfter = max(cfg.minTimeout, cfg.timeoutMul * maxGoodDuration)
+                # Confirm the carried-over elites before breeding from them.
+                elites = [ind for ind in pop if ind.valid] if cfg.rerunElites else []
+                if elites and remaining > len(elites):
+                    eliteJobs = [(cfg, ind, self.caseStudy, goalXY, killAfter) for ind in elites]
+                    attemptsUsed += runRetryingBatch(
+                        cfg, eliteJobs, rerun, "elite confirmation %d" % gen, len(elites))
+                    for ind in elites:
+                        self.rescore(cfg, ind)
+                    remaining = attemptBudget - attemptsUsed
+                    candidates = candidates[:remaining]
+                jobs = [(cfg, ind, self.caseStudy, goalXY, killAfter) for ind in candidates]
+                usedNow = runRetryingBatch(cfg, jobs, evaluate, f"generation {gen}", remaining)
+                attemptsUsed += usedNow
+
+                for ind in candidates:
+                    if ind.valid and ind not in evaluated:
+                        ind.generation = gen
+                        evaluated.append(ind)
+                        # Only reached-goal runs feed the threshold; otherwise a slow
+                        # stuck run would inflate the budget and disarm the watchdog.
+                        if not ind.stuck and ind.duration > maxGoodDuration:
+                            maxGoodDuration = ind.duration
+
+                best = min(evaluated, key=officialRank) if evaluated else None
+                logger.info(
+                    "[gen %d] best official score=%.4f discovery attempts=%d/%d",
+                    gen,
+                    best.officialScore if best is not None else 0.0,
+                    attemptsUsed,
+                    attemptBudget,
+                )
+                if usedNow == 0:
+                    noProgressRounds += 1
+                else:
+                    noProgressRounds = 0
+
+            if attemptsUsed < attemptBudget:
+                logger.warning(
+                    "discovery stopped after %d no-progress rounds; %d attempts remain",
+                    noProgressRounds,
+                    attemptBudget - attemptsUsed,
+                )
+            return attemptsUsed
+
+        discoveryAttempts += runDiscovery(phase1Budget)
+
+        # Refine only the candidates that would provisionally be submitted. This
+        # spends reruns on positive, distinct results rather than zero-point or
+        # already-filtered layouts.
+        provisional, _ = selectSuite(cfg, evaluated, calibrateThreshold(evaluated))
+        promising = [
+            ind
+            for ind in provisional
+            if ind.distances and ind.distances[0] < cfg.refineThreshold
+        ]
         rerunJobs = []
-        for cand in promising:
-            if simsLeft <= 0:
+        killAfter = max(cfg.minTimeout, cfg.timeoutMul * maxGoodDuration)
+        # Round-robin ordering gives every provisional result a second run
+        # before any result gets a third.
+        for rerunIndex in range(cfg.nReruns):
+            for cand in promising:
+                existingReruns = max(0, len(cand.distances) - 1)
+                if existingReruns <= rerunIndex and len(rerunJobs) < phase2Budget:
+                    rerunJobs.append((cfg, cand, self.caseStudy, goalXY, killAfter))
+            if len(rerunJobs) >= phase2Budget:
                 break
-            nMore = min(cfg.nReruns, simsLeft)
-            killAfter = max(cfg.minTimeout, cfg.timeoutMul * maxGoodDuration)
-            for _ in range(nMore):
-                rerunJobs.append((cfg, cand, self.caseStudy, goalXY, killAfter))
-                simsLeft -= 1
-        runParallelBatch(cfg, rerunJobs, rerun, "refinement")
+
+        refinementAttempts = 0
+        if rerunJobs:
+            refinementAttempts = runRetryingBatch(cfg, rerunJobs, rerun, "refinement", phase2Budget)
         for cand in promising:
             if len(cand.distances) > 1:
-                cand.fitness = fitnessFor(
-                    cand.distances,
-                    len(cand.obstacles),
-                    cand.executionDurations,
-                )
-                cand.officialScore = -cand.fitness
+                self.rescore(cfg, cand)
                 meanD = sum(cand.distances) / len(cand.distances)
                 logger.info(
                     "refined: runs=%d mean-distance=%.2f official-score=%.4f",
@@ -1002,14 +920,40 @@ class GeneticGenerator:
                     cand.officialScore,
                 )
 
-        evaluated.sort(key=selectionKey)
-        selected: List[Individual] = []
-        for cand in evaluated:
-            if len(selected) >= cfg.topK:
-                break
-            if not isTooSimilar(cfg, cand, selected):
-                selected.append(cand)
-        top = [s.testCase for s in selected]
+        # If there were too few useful reruns, spend the remainder discovering
+        # new layouts. The same global ledger keeps total attempts <= budget.
+        totalAttempts = discoveryAttempts + refinementAttempts
+        if totalAttempts < budget:
+            returnedBudget = budget - totalAttempts
+            logger.info(
+                "returning %d unused refinement attempts to discovery",
+                returnedBudget,
+            )
+            discoveryAttempts += runDiscovery(returnedBudget)
+            totalAttempts = discoveryAttempts + refinementAttempts
+
+        zeroPointCount = sum(1 for cand in evaluated if cand.officialScore <= 0.0)
+        # Re-select from the full positive pool after refinement. Candidates
+        # demoted by reruns are automatically replaced when alternatives exist.
+        threshold = calibrateThreshold(evaluated)
+        selected, threshold = selectSuite(cfg, evaluated, threshold)
+        logger.info(
+            "suite: tests=%d sum-score=%.4f mean-trajectory-distance=%.2f threshold=%.2f",
+            len(selected),
+            sum(ind.officialScore for ind in selected),
+            suiteDiversity(selected),
+            threshold,
+        )
         refinedCount = sum(1 for i in evaluated if len(i.distances) > 1)
-        logger.info("GA done. returning %d tests (refined %d).", len(top), refinedCount)
-        return top
+        logger.info(
+            "GA done. attempts=%d/%d returning %d positive-score tests "
+            "(refined %d, dropped zero-point %d).",
+            totalAttempts,
+            budget,
+            len(selected),
+            refinedCount,
+            zeroPointCount,
+        )
+        # Every evaluated layout stays available for inspection after the run.
+        self.evaluated = evaluated
+        return [s.testCase for s in selected]
