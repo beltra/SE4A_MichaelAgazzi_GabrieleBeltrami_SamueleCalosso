@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 PLOT_LOCK = threading.Lock()
 
 
-def is_isolated_execution() -> bool:
+def is_isolated_execution():
     return AGENT in (AgentConfig.DOCKER, AgentConfig.K8S)
 
 
@@ -66,8 +66,12 @@ class TestCase(object):
     def plot(self):
         # Matplotlib has process-global state and is not thread-safe. Simulator
         # execution stays parallel; only the short plot operation is serialized.
+        # Aerialist names plots by the second they were saved, so two tests
+        # finishing together would silently share one file. Name it ourselves.
         with PLOT_LOCK:
-            self.plot_file = Plot.plot_test(self.test, self.test_results)
+            self.plot_file = Plot.plot_test(
+                self.test, self.test_results, filename=f"plot-{uuid.uuid4().hex[:12]}"
+            )
 
     def save_yaml(self, path):
         self.test.to_yaml(path)

@@ -16,6 +16,11 @@ class ParallelDockerAgent(DockerAgent):
 
     DOCKER_IMG = config("DOCKER_IMG", default="docker-uav-testing")
     USE_GPU = config("SIM_WORKER_GPU", default=True, cast=bool)
+    # Docker inside an LXC container cannot apply its default AppArmor
+    # profile and every worker fails to start; SIM_WORKER_SECURITY_OPT
+    # ("apparmor=unconfined" there) is passed on to `docker run`. Empty
+    # everywhere else, so the normal profile stays in force.
+    SECURITY_OPT = config("SIM_WORKER_SECURITY_OPT", default="")
     # The avoidance depth camera needs an OpenGL context even in headless mode.
     # A private Xvfb display gives every worker its own context and display ID.
     CPU_CMD = (
@@ -37,6 +42,8 @@ class ParallelDockerAgent(DockerAgent):
             "-td",
             "--shm-size=2g",
         ]
+        if self.SECURITY_OPT:
+            command.extend(["--security-opt", self.SECURITY_OPT])
         if self.USE_GPU:
             command.extend(
                 [

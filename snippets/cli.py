@@ -62,7 +62,7 @@ def config_loggers():
     root.addHandler(f_handler)
 
 
-def _ensure_virtual_display() -> None:
+def _ensure_virtual_display():
     """Start Xvfb when DISPLAY is remote or unset.
 
     On Windows, DISPLAY is forwarded as host.docker.internal:0.0 (a remote X11

@@ -50,7 +50,7 @@ DRONE_NEW = (
 )
 
 
-def patchLaunch() -> str:
+def patchLaunch():
     if not os.path.exists(LAUNCH_PATH):
         return f"launch: missing ({LAUNCH_PATH})"
     with open(LAUNCH_PATH) as fh:
@@ -64,7 +64,7 @@ def patchLaunch() -> str:
     return "launch: patched"
 
 
-def patchSimulator() -> str:
+def patchSimulator():
     if not os.path.exists(SIMULATOR_PATH):
         return f"simulator: missing ({SIMULATOR_PATH})"
     with open(SIMULATOR_PATH) as fh:
@@ -78,7 +78,7 @@ def patchSimulator() -> str:
     return "simulator: patched"
 
 
-def patchDrone() -> str:
+def patchDrone():
     if not os.path.exists(DRONE_PATH):
         return f"drone: missing ({DRONE_PATH})"
     with open(DRONE_PATH) as fh:
@@ -92,7 +92,7 @@ def patchDrone() -> str:
     return "drone: patched"
 
 
-def applyPatches() -> None:
+def applyPatches():
     print(patchLaunch())
     print(patchSimulator())
     print(patchDrone())

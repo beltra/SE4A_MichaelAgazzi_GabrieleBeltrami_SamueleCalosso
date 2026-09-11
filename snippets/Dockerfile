@@ -17,6 +17,10 @@ COPY ./requirements.txt /src/generator/requirements.txt
 WORKDIR /src/generator/
 RUN pip3 install -r /src/generator/requirements.txt
 
+# The competition builds this image and runs cli.py inside it, so the code
+# must be in the image; the compose files mount the live folder over it.
+COPY ./ /src/generator/
+RUN mkdir -p ./logs/ ./results/ ./generated_tests/
 
 ENV AGENT=local
 ENV AVOIDANCE_LAUNCH=/src/aerialist/aerialist/resources/simulation/collision_prevention.launch
