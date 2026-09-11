@@ -1,0 +1,12 @@
+robot:
+  port: ros
+  params_file: case_studies/mission-params.csv
+  mission_file: case_studies/mission7.plan
+
+simulation:
+  simulator: ros
+  speed: 1
+  headless: true
+
+mission:
+  commands_file: case_studies/mission-commands.csv

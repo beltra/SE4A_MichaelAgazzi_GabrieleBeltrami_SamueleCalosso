@@ -5,8 +5,8 @@ robot:
 
 simulation:
   simulator: ros #{gazebo, jmavsim, ros} 
-  speed: 10
-  headless: true 
+  speed: 1
+  headless: true
   # obstacles:
   # - size:
   #     l: 10

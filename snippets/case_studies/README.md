@@ -21,14 +21,14 @@ Some other similar case studies will be used for the evaluation.
 3. Landing
 
 ```yaml
-drone:
+robot:
   port: ros #{sitl, ros, cf}
   params_file: case_studies/mission-params.csv 
   mission_file: case_studies/mission1.plan
 
 simulation:
   simulator: ros #{gazebo, jmavsim, ros} 
-  speed: 2.0
+  speed: 1
   headless: true
 #   obstacles:
 #   - size:
@@ -50,7 +50,7 @@ simulation:
 #       z: 0
 #       r: 0
 
-test:
+mission:
   commands_file: case_studies/mission-commands.csv
 
 ```
@@ -67,14 +67,14 @@ test:
 4. Landing
 
 ```yaml
-drone:
+robot:
   port: ros #{sitl, ros, cf}
   params_file: case_studies/mission-params.csv 
   mission_file: case_studies/mission2.plan
 
 simulation:
   simulator: ros #{gazebo, jmavsim, ros} 
-  speed: 2.0
+  speed: 1
   headless: true
 #   obstacles:
 #   - size:
@@ -96,7 +96,7 @@ simulation:
 #       z: 0
 #       r: 0
 
-test:
+mission:
   commands_file: case_studies/mission-commands.csv
 
 ```
@@ -114,14 +114,14 @@ test:
 5. Landing
 
 ```yaml
-drone:
+robot:
   port: ros #{sitl, ros, cf}
   params_file: case_studies/mission-params.csv 
   mission_file: case_studies/mission3.plan
 
 simulation:
   simulator: ros #{gazebo, jmavsim, ros} 
-  speed: 2.0
+  speed: 1
   headless: true
 #   obstacles:
 #   - size:
@@ -143,9 +143,28 @@ simulation:
 #       z: 0
 #       r: 0
 
-test:
+mission:
   commands_file: case_studies/mission-commands.csv
 
 ```
 
 <p align="center"><img src="mission3.png" alt="case study 3" width="50%"/><img src="mission3-2.png" alt="case study 3" width="50%"/></p>
+
+## Case Studies 4 to 7 (added by the team)
+
+These missions were added to test the generator on paths other than the three
+starter ones. Each has a `.plan`, a `.yaml` and a `.png` of the obstacle-free
+flight. Waypoints are given in metres from the home position as (north,
+east), the frame `mission.py` builds from latitude and longitude; a
+"segment" is the straight stretch between two of them.
+
+| mission | route | segments long enough for a wall |
+|---|---|---|
+| `mission4.yaml` | 2025 official mission 4: out to (47, 51), a 15 m hop to (36, 61), back to (-17, 1) | 1 (69 m) and 3 (80 m) |
+| `mission5.yaml` | 2025 official mission 5: a triangle over (37, 28) and (-7, 50) back to home | 1, 2, 3 (46-51 m) |
+| `mission6.yaml` | six waypoints around the area: (-1, 8), (27, 31), (-6, 46), (-41, 20), (4, 4) | 2, 3, 4, 5 (36-47 m) |
+| `mission7.yaml` | mission 3 extended with a second loop: (4, 53), (-14, 54), (-18, 1), (-35, 2), (-32, 55) | 1, 3, 5 (53 m each) |
+
+`mission4.yaml` and `mission5.yaml` re-encode the 2025 competition plans with
+the paths adapted to this folder; every mission runs at simulation speed 1,
+the setting the competition evaluates at.
