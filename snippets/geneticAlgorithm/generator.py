@@ -125,6 +125,10 @@ class GAConfig:
     maxFlakeRetries: int = 2
     timeoutMul: float = 2.5
     minTimeout: float = 300.0
+    # A layout that keeps failing to run has no
+    # way to turn illegal, so nothing else retires it: without this cap it
+    # would be retried with the same genes until the whole budget is gone.
+    maxRunFailures: int = 2
 
 
 @dataclass(eq=False)
@@ -156,6 +160,10 @@ class Individual:
     duration: float = 0.0
     # Discovery generation the layout was evaluated in (0 for the seeds).
     generation: int = 0
+    # Failed simulator attempts so far, while still unresolved (not valid,
+    # not illegal). Reset is unnecessary: an individual stops accumulating
+    # this the moment it turns valid, since it then leaves freeSlots for good.
+    attempts: int = 0
 
 
 class AttemptOutcome(IntEnum):
@@ -489,6 +497,7 @@ def evaluate(
         ind.valid = False
         ind.illegal = True
         return AttemptOutcome.SKIPPED
+    ind.attempts += 1
     isolated = is_isolated_execution()
     timer, killed = (None, [False]) if isolated else armWatchdog(killAfter)
     t0 = time.monotonic()
@@ -836,7 +845,8 @@ class GeneticGenerator:
                     else:
                         pop = [freshIndividual(self.rng, cfg, self.segments, self.seedSegments, n) for n in counts]
                     freeSlots = [idx for idx, ind in enumerate(pop) if not ind.valid and not ind.illegal]
-                candidates = [pop[idx] for idx in freeSlots[:remaining]]
+                candidateSlots = freeSlots[:remaining]
+                candidates = [pop[idx] for idx in candidateSlots]
 
                 killAfter = max(cfg.minTimeout, cfg.timeoutMul * maxGoodDuration)
                 # Confirm the carried-over elites before breeding from them.
@@ -848,12 +858,13 @@ class GeneticGenerator:
                     for ind in elites:
                         self.rescore(cfg, ind)
                     remaining = attemptBudget - attemptsUsed
+                    candidateSlots = candidateSlots[:remaining]
                     candidates = candidates[:remaining]
                 jobs = [(cfg, ind, self.caseStudy, goalXY, killAfter) for ind in candidates]
                 usedNow = runRetryingBatch(cfg, jobs, evaluate, f"generation {gen}", remaining)
                 attemptsUsed += usedNow
 
-                for ind in candidates:
+                for slotIdx, ind in zip(candidateSlots, candidates):
                     if ind.valid and ind not in evaluated:
                         ind.generation = gen
                         evaluated.append(ind)
@@ -861,6 +872,16 @@ class GeneticGenerator:
                         # stuck run would inflate the budget and disarm the watchdog.
                         if not ind.stuck and ind.duration > maxGoodDuration:
                             maxGoodDuration = ind.duration
+                    elif not ind.valid and not ind.illegal and ind.attempts >= cfg.maxRunFailures:
+                        # A layout that keeps failing (e.g. traps the drone so
+                        # it never lands) would otherwise be retried with the
+                        # same genes until the budget runs out; reseed the slot.
+                        logger.warning(
+                            "giving up on %s after %d failed attempts; reseeding the slot",
+                            ind.genes, ind.attempts,
+                        )
+                        pop[slotIdx] = freshIndividual(
+                            self.rng, cfg, self.segments, self.seedSegments, nicheOf(ind))
 
                 best = min(evaluated, key=officialRank) if evaluated else None
                 logger.info(
